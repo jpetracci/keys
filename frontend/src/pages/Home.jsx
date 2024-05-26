@@ -1,5 +1,6 @@
 import { useState, useEffect } from "react";
 import api from "../api";
+import Transaction from "../components/Transaction";
 
 function Home() {
   const [transactions, setTransactions] = useState([]);
@@ -48,6 +49,13 @@ function Home() {
     <div>
       <div>
         <h2>Transactions</h2>
+        {transactions.map((transaction) => (
+          <Transaction
+            transaction={transaction}
+            onDelete={deleteTransaction}
+            key={transaction.id}
+          />
+        ))}
       </div>
       <h2>Create a transaction</h2>
       <form onSubmit={createTransaction}>

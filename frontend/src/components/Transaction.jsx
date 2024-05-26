@@ -21,4 +21,4 @@ function Transaction({ transaction, onDelete }) {
   );
 }
 
-export default Note;
+export default Transaction;
