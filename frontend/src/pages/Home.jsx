@@ -1,6 +1,7 @@
 import { useState, useEffect } from "react";
 import api from "../api";
 import Transaction from "../components/Transaction";
+import "../styles/Home.css";
 
 function Home() {
   const [transactions, setTransactions] = useState([]);
