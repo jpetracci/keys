@@ -26,7 +26,7 @@ function Home() {
 
   const deleteTransaction = (id) => {
     api
-      .delete(`/api/notes/delete/${id}/`)
+      .delete(`/api/transactions/delete/${id}/`)
       .then((res) => {
         if (res.status === 204) alert("transaction was delete");
         else alert("failed to delete");
