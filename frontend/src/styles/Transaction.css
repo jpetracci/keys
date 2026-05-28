@@ -1,33 +1,110 @@
 .transaction-container {
-  padding: 10px;
-  margin: 20px 0;
-  border: 1px solid #ccc;
-  border-radius: 5px;
+  align-items: center;
+  background: #ffffff;
+  border: 1px solid #e5e7eb;
+  border-radius: 8px;
+  display: grid;
+  gap: 1rem;
+  grid-template-columns: minmax(220px, 1fr) 120px 120px auto;
+  padding: 1rem;
 }
 
-.transaction-title {
-  color: #333;
+.transaction-container.editing {
+  grid-template-columns: minmax(160px, 1fr) 140px 130px 110px 130px auto;
 }
 
-.transaction-content {
-  color: #666;
+.transaction-container p {
+  margin: 0;
+}
+
+.transaction-description {
+  color: #111827;
+  font-weight: 700;
+}
+
+.transaction-meta {
+  color: #6b7280;
+  font-size: 0.9rem;
+  margin-top: 0.25rem !important;
 }
 
 .transaction-date {
-  color: #999;
-  font-size: 0.8rem;
+  color: #6b7280;
+  font-size: 0.9rem;
+}
+
+.transaction-amount {
+  font-weight: 700;
+  text-align: right;
+}
+
+.transaction-amount.positive {
+  color: #047857;
+}
+
+.transaction-amount.negative {
+  color: #b91c1c;
+}
+
+.row-actions {
+  display: flex;
+  gap: 0.5rem;
+  justify-content: flex-end;
+}
+
+.edit-input {
+  border: 1px solid #d1d5db;
+  border-radius: 4px;
+  padding: 8px;
+  width: 100%;
+  box-sizing: border-box;
+}
+
+.edit-button {
+  background-color: #2563eb;
+  border: none;
+  border-radius: 5px;
+  color: white;
+  cursor: pointer;
+  padding: 10px 16px;
+  transition: background-color 0.2s;
+}
+
+.edit-button:hover {
+  background-color: #1d4ed8;
 }
 
 .delete-button {
-  background-color: #f44336; /* Red */
-  color: white;
+  background-color: #f44336;
   border: none;
-  padding: 10px 20px;
   border-radius: 5px;
+  color: white;
   cursor: pointer;
+  padding: 10px 16px;
   transition: background-color 0.3s;
 }
 
 .delete-button:hover {
-  background-color: #d32f2f; /* Darker red */
+  background-color: #d32f2f;
+}
+
+.row-actions button:disabled {
+  cursor: not-allowed;
+  opacity: 0.6;
+}
+
+@media (max-width: 800px) {
+  .transaction-container,
+  .transaction-container.editing {
+    align-items: start;
+    grid-template-columns: 1fr;
+  }
+
+  .transaction-amount {
+    text-align: left;
+  }
+
+  .row-actions {
+    justify-content: flex-start;
+  }
 }
