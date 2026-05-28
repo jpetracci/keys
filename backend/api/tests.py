@@ -27,6 +27,65 @@ class ImportTransactionsCommandTests(TestCase):
             call_command("import_transactions", str(csv_path), stdout=StringIO())
             self.assertEqual(Transaction.objects.count(), 2)
 
+    def test_dedupes_when_same_file_is_renamed(self):
+        with TemporaryDirectory() as temp_dir:
+            original = Path(temp_dir) / "march.csv"
+            original.write_text(
+                "Date,Description,Category,Amount,Status\n"
+                "2024-03-01,Paycheck,Income,100.00,Posted\n"
+                "2024-03-02,Groceries,Food,-25.50,Posted\n",
+                encoding="utf-8",
+            )
+            call_command("import_transactions", str(original), stdout=StringIO())
+
+            renamed = Path(temp_dir) / "march-copy.csv"
+            renamed.write_text(original.read_text(encoding="utf-8"), encoding="utf-8")
+            call_command("import_transactions", str(renamed), stdout=StringIO())
+
+        self.assertEqual(Transaction.objects.count(), 2)
+
+    def test_dedupes_when_rows_shift_position(self):
+        with TemporaryDirectory() as temp_dir:
+            first = Path(temp_dir) / "a.csv"
+            first.write_text(
+                "Date,Description,Category,Amount,Status\n"
+                "2024-03-01,Paycheck,Income,100.00,Posted\n"
+                "2024-03-02,Groceries,Food,-25.50,Posted\n",
+                encoding="utf-8",
+            )
+            call_command("import_transactions", str(first), stdout=StringIO())
+
+            # Same two rows but with one extra prior-period row shifting their
+            # line numbers. Only the new row should be inserted.
+            second = Path(temp_dir) / "b.csv"
+            second.write_text(
+                "Date,Description,Category,Amount,Status\n"
+                "2024-02-28,Old Charge,Misc,-1.00,Posted\n"
+                "2024-03-01,Paycheck,Income,100.00,Posted\n"
+                "2024-03-02,Groceries,Food,-25.50,Posted\n",
+                encoding="utf-8",
+            )
+            call_command("import_transactions", str(second), stdout=StringIO())
+
+        self.assertEqual(Transaction.objects.count(), 3)
+
+    def test_preserves_legitimate_same_day_duplicates(self):
+        with TemporaryDirectory() as temp_dir:
+            csv_path = Path(temp_dir) / "coffee.csv"
+            csv_path.write_text(
+                # Two identical $5 charges on the same day are real, not a dedup target.
+                "Date,Description,Category,Amount,Status\n"
+                "2024-03-01,Coffee Shop,Food,-5.00,Posted\n"
+                "2024-03-01,Coffee Shop,Food,-5.00,Posted\n",
+                encoding="utf-8",
+            )
+            call_command("import_transactions", str(csv_path), stdout=StringIO())
+            self.assertEqual(Transaction.objects.count(), 2)
+
+            # Re-importing the same file must still dedupe both rows.
+            call_command("import_transactions", str(csv_path), stdout=StringIO())
+            self.assertEqual(Transaction.objects.count(), 2)
+
     def test_imports_debit_credit_csvs(self):
         with TemporaryDirectory() as temp_dir:
             csv_path = Path(temp_dir) / "card.csv"

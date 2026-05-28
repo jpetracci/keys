@@ -70,9 +70,11 @@ python manage.py import_transactions ../statements --user <username>
 Useful options:
 
 - `--dry-run` parses files without writing records
-- `--account "Checking"` overrides the account name stored for imported rows
+- `--account "Checking"` tags every imported row with that account name. By default no account is assigned, which lets you re-import the same statement under a different filename without creating duplicates. Pass this when you want per-account grouping.
 - `--include-pending` includes rows with statuses other than Posted/Cleared
 - `--debits-positive` flips Debit/Credit CSV handling when needed
+
+The importer deduplicates on transaction *content* (date + description + amount + account + category), with an occurrence index so two genuinely identical same-day charges (e.g. two $5 coffees) are both kept.
 
 The importer handles the CSV shapes currently in `statements/`, including Chase, Discover, SoFi, Citi, USAA, and Debit/Credit-column exports.
 

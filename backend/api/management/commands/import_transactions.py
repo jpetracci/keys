@@ -14,6 +14,31 @@ DATE_FORMATS = ("%Y-%m-%d", "%m/%d/%Y", "%m/%d/%y")
 POSTED_STATUSES = {"", "posted", "cleared"}
 
 
+def build_content_fingerprint(
+    *, user_id, account_name, trans_date, trans_description, trans_category, trans_amount
+):
+    """Stable content-only fingerprint string for a transaction.
+
+    Shared with the 0005 data migration so backfilled hashes match the runtime
+    importer's hashes exactly.
+    """
+    return "|".join(
+        [
+            str(user_id) if user_id is not None else "",
+            (account_name or "").lower(),
+            trans_date.isoformat() if trans_date else "",
+            (trans_description or "").lower(),
+            (trans_category or "").lower(),
+            str(trans_amount),
+        ]
+    )
+
+
+def hash_with_occurrence(fingerprint, occurrence):
+    payload = f"{fingerprint}|{occurrence}".encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
 class Command(BaseCommand):
     help = "Import transactions from common bank and credit-card CSV statement exports."
 
@@ -34,7 +59,11 @@ class Command(BaseCommand):
         parser.add_argument(
             "--account",
             default="",
-            help="Account name to apply to every imported row. Defaults to each file name.",
+            help=(
+                "Account name to apply to every imported row. Defaults to empty so "
+                "that re-importing the same statement under a different filename "
+                "still dedupes correctly; pass --account to group rows per account."
+            ),
         )
         parser.add_argument(
             "--default-category",
@@ -73,6 +102,11 @@ class Command(BaseCommand):
         if not files:
             raise CommandError("No CSV files found.")
 
+        # Track occurrences of each content fingerprint across this whole run so
+        # legitimate same-content rows (e.g. two $5 coffees on the same day) get
+        # distinct hashes instead of collapsing into one.
+        self._run_seen = {}
+
         totals = {"created": 0, "skipped": 0, "errors": 0}
         for csv_file in files:
             stats = self._import_file(csv_file, user, options)
@@ -108,7 +142,7 @@ class Command(BaseCommand):
 
     def _import_file(self, csv_file, user, options):
         stats = {"created": 0, "skipped": 0, "errors": 0}
-        account_name = options["account"] or csv_file.stem
+        account_name = options["account"]
 
         with csv_file.open(newline="", encoding="utf-8-sig") as handle:
             reader = csv.DictReader(handle)
@@ -134,12 +168,15 @@ class Command(BaseCommand):
                     continue
 
                 import_hash = self._hash_transaction(
-                    user.id if user else None, transaction, csv_file.name, row_number
+                    user.id if user else None, transaction
                 )
-                exists = Transaction.objects.filter(
+                if import_hash is None:
+                    # Row is a re-import of a transaction already in the DB.
+                    stats["skipped"] += 1
+                    continue
+                if Transaction.objects.filter(
                     author=user, import_hash=import_hash
-                ).exists()
-                if exists:
+                ).exists():
                     stats["skipped"] += 1
                     continue
 
@@ -221,17 +258,41 @@ class Command(BaseCommand):
                 return (value or "").strip()
         return ""
 
-    def _hash_transaction(self, user_id, transaction, source_file, row_number):
-        fingerprint = "|".join(
-            [
-                str(user_id) if user_id is not None else "",
-                source_file.lower(),
-                str(row_number),
-                transaction["account_name"].lower(),
-                transaction["trans_date"].isoformat(),
-                transaction["trans_description"].lower(),
-                transaction["trans_category"].lower(),
-                str(transaction["trans_amount"]),
-            ]
+    def _hash_transaction(self, user_id, transaction):
+        """Return a stable dedup hash for the transaction, or ``None`` to skip.
+
+        The fingerprint is content-only (no filename or row number), so the
+        same statement re-imported under a different name -- or a statement
+        that overlaps a previous import -- dedupes correctly.
+
+        Legitimate same-content duplicates (e.g. two identical $5 coffee
+        charges on the same day) are preserved by appending an occurrence
+        index. We return ``None`` when the run has already seen as many
+        copies of this content as the DB currently stores, meaning this row
+        is a re-import of something already on disk.
+        """
+        fingerprint = build_content_fingerprint(
+            user_id=user_id,
+            account_name=transaction["account_name"],
+            trans_date=transaction["trans_date"],
+            trans_description=transaction["trans_description"],
+            trans_category=transaction["trans_category"],
+            trans_amount=transaction["trans_amount"],
         )
-        return hashlib.sha256(fingerprint.encode("utf-8")).hexdigest()
+
+        existing = Transaction.objects.filter(
+            author_id=user_id,
+            account_name=transaction["account_name"],
+            trans_date=transaction["trans_date"],
+            trans_description=transaction["trans_description"],
+            trans_category=transaction["trans_category"],
+            trans_amount=transaction["trans_amount"],
+        ).count()
+        seen = self._run_seen.get(fingerprint, 0)
+        self._run_seen[fingerprint] = seen + 1
+
+        if seen < existing:
+            # The DB already holds at least `seen + 1` copies of this content;
+            # treat this CSV row as the (seen+1)-th re-import and skip it.
+            return None
+        return hash_with_occurrence(fingerprint, seen)
