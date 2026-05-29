@@ -15,11 +15,16 @@ POSTED_STATUSES = {"", "posted", "cleared"}
 
 
 def build_content_fingerprint(
-    *, user_id, account_name, trans_date, trans_description, trans_category, trans_amount
+    *, user_id, account_name, trans_date, trans_description, trans_amount
 ):
     """Stable content-only fingerprint string for a transaction.
 
-    Shared with the 0005 data migration so backfilled hashes match the runtime
+    Category is deliberately excluded: banks sometimes re-categorize the same
+    transaction between exports, and users may edit categories themselves
+    through the UI. Including category in the fingerprint would cause those
+    edits to surface as duplicates on the next import.
+
+    Shared with the data migrations so backfilled hashes match the runtime
     importer's hashes exactly.
     """
     return "|".join(
@@ -28,7 +33,6 @@ def build_content_fingerprint(
             (account_name or "").lower(),
             trans_date.isoformat() if trans_date else "",
             (trans_description or "").lower(),
-            (trans_category or "").lower(),
             str(trans_amount),
         ]
     )
@@ -276,7 +280,6 @@ class Command(BaseCommand):
             account_name=transaction["account_name"],
             trans_date=transaction["trans_date"],
             trans_description=transaction["trans_description"],
-            trans_category=transaction["trans_category"],
             trans_amount=transaction["trans_amount"],
         )
 
@@ -285,7 +288,6 @@ class Command(BaseCommand):
             account_name=transaction["account_name"],
             trans_date=transaction["trans_date"],
             trans_description=transaction["trans_description"],
-            trans_category=transaction["trans_category"],
             trans_amount=transaction["trans_amount"],
         ).count()
         seen = self._run_seen.get(fingerprint, 0)

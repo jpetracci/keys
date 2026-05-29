@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react"
+import { useEffect, useState } from "react"
 import api from "../api"
 import Transaction from "../components/Transaction"
 import "../styles/Home.css"
@@ -10,44 +10,51 @@ const currencyFormatter = new Intl.NumberFormat("en-US", {
 
 const today = new Date().toISOString().slice(0, 10)
 
+const EMPTY_FORM = {
+  trans_date: today,
+  trans_description: "",
+  trans_category: "Uncategorized",
+  trans_amount: "",
+  account_name: "",
+}
+
+const EMPTY_SUMMARY = { income: "0", expenses: "0", net: "0", count: 0 }
+
 function Home() {
   const [transactions, setTransactions] = useState([])
-  const [formData, setFormData] = useState({
-    trans_date: today,
-    trans_description: "",
-    trans_category: "Uncategorized",
-    trans_amount: "",
-    account_name: "",
-  })
+  const [summary, setSummary] = useState(EMPTY_SUMMARY)
+  const [nextPageUrl, setNextPageUrl] = useState(null)
+  const [formData, setFormData] = useState(EMPTY_FORM)
   const [loading, setLoading] = useState(true)
+  const [loadingMore, setLoadingMore] = useState(false)
   const [error, setError] = useState("")
 
-  const totals = useMemo(() => {
-    return transactions.reduce(
-      (summary, transaction) => {
-        const amount = Number(transaction.trans_amount)
-        summary.net += amount
-        if (amount >= 0) {
-          summary.income += amount
-        } else {
-          summary.expenses += amount
-        }
-        return summary
-      },
-      { income: 0, expenses: 0, net: 0 }
-    )
-  }, [transactions])
-
   useEffect(() => {
-    getTransactions()
+    refresh()
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
-  const getTransactions = async () => {
+  // Server-side totals: always accurate regardless of pagination, and avoids
+  // the floating-point drift of summing currency strings on the client.
+  const refreshSummary = async () => {
+    try {
+      const res = await api.get("/api/transactions/summary/")
+      setSummary(res.data)
+    } catch (err) {
+      console.error(err)
+    }
+  }
+
+  const refresh = async () => {
     setLoading(true)
     setError("")
     try {
-      const res = await api.get("/api/transactions/")
-      setTransactions(res.data)
+      const [listRes] = await Promise.all([
+        api.get("/api/transactions/"),
+        refreshSummary(),
+      ])
+      setTransactions(listRes.data.results || [])
+      setNextPageUrl(listRes.data.next || null)
     } catch (err) {
       setError("Could not load transactions.")
       console.error(err)
@@ -56,12 +63,29 @@ function Home() {
     }
   }
 
+  const loadMore = async () => {
+    if (!nextPageUrl) return
+    setLoadingMore(true)
+    try {
+      // nextPageUrl is an absolute URL from DRF; strip the origin so axios
+      // routes it through the configured baseURL (handy in Choreo).
+      const path = nextPageUrl.replace(/^https?:\/\/[^/]+/, "")
+      const res = await api.get(path)
+      setTransactions((current) => [...current, ...(res.data.results || [])])
+      setNextPageUrl(res.data.next || null)
+    } catch (err) {
+      setError("Could not load more transactions.")
+      console.error(err)
+    } finally {
+      setLoadingMore(false)
+    }
+  }
+
   const deleteTransaction = async (id) => {
     try {
       await api.delete(`/api/transactions/${id}/`)
-      setTransactions((currentTransactions) =>
-        currentTransactions.filter((transaction) => transaction.id !== id)
-      )
+      setTransactions((current) => current.filter((t) => t.id !== id))
+      refreshSummary()
     } catch (err) {
       setError("Could not delete the transaction.")
       console.error(err)
@@ -71,11 +95,13 @@ function Home() {
   const updateTransaction = async (id, changes) => {
     try {
       const res = await api.patch(`/api/transactions/${id}/`, changes)
-      setTransactions((currentTransactions) =>
-        currentTransactions.map((transaction) =>
-          transaction.id === id ? res.data : transaction
-        )
+      setTransactions((current) =>
+        current.map((t) => (t.id === id ? res.data : t))
       )
+      // Amount may have changed -- refresh totals.
+      if (Object.prototype.hasOwnProperty.call(changes, "trans_amount")) {
+        refreshSummary()
+      }
     } catch (err) {
       setError("Could not update the transaction.")
       console.error(err)
@@ -89,14 +115,9 @@ function Home() {
 
     try {
       const res = await api.post("/api/transactions/", formData)
-      setTransactions((currentTransactions) => [res.data, ...currentTransactions])
-      setFormData({
-        trans_date: today,
-        trans_description: "",
-        trans_category: "Uncategorized",
-        trans_amount: "",
-        account_name: "",
-      })
+      setTransactions((current) => [res.data, ...current])
+      setFormData(EMPTY_FORM)
+      refreshSummary()
     } catch (err) {
       setError("Could not create the transaction.")
       console.error(err)
@@ -104,26 +125,30 @@ function Home() {
   }
 
   const handleChange = (e) => {
-    setFormData((currentFormData) => ({
-      ...currentFormData,
+    setFormData((current) => ({
+      ...current,
       [e.target.name]: e.target.value,
     }))
   }
+
+  // Currency strings are formatted once here; arithmetic happens on the
+  // server in Decimal so totals don't drift.
+  const formatAmount = (value) => currencyFormatter.format(Number(value || 0))
 
   return (
     <main className="home-page">
       <section className="summary-grid" aria-label="Transaction summary">
         <div className="summary-card">
           <span>Income / Credits</span>
-          <strong>{currencyFormatter.format(totals.income)}</strong>
+          <strong>{formatAmount(summary.income)}</strong>
         </div>
         <div className="summary-card">
           <span>Expenses / Debits</span>
-          <strong>{currencyFormatter.format(totals.expenses)}</strong>
+          <strong>{formatAmount(summary.expenses)}</strong>
         </div>
         <div className="summary-card">
           <span>Net</span>
-          <strong>{currencyFormatter.format(totals.net)}</strong>
+          <strong>{formatAmount(summary.net)}</strong>
         </div>
       </section>
 
@@ -132,23 +157,38 @@ function Home() {
       <section className="transaction-section">
         <div className="section-header">
           <h2>Transactions</h2>
-          <button type="button" onClick={getTransactions} disabled={loading}>
+          <button type="button" onClick={refresh} disabled={loading}>
             Refresh
           </button>
         </div>
         {loading ? (
           <p>Loading transactions...</p>
         ) : transactions.length ? (
-          <div className="transaction-list">
-            {transactions.map((transaction) => (
-              <Transaction
-                transaction={transaction}
-                onDelete={deleteTransaction}
-                onUpdate={updateTransaction}
-                key={transaction.id}
-              />
-            ))}
-          </div>
+          <>
+            <div className="transaction-list">
+              {transactions.map((transaction) => (
+                <Transaction
+                  transaction={transaction}
+                  onDelete={deleteTransaction}
+                  onUpdate={updateTransaction}
+                  key={transaction.id}
+                />
+              ))}
+            </div>
+            <p className="transaction-count">
+              Showing {transactions.length} of {summary.count}
+            </p>
+            {nextPageUrl && (
+              <button
+                type="button"
+                onClick={loadMore}
+                disabled={loadingMore}
+                className="load-more"
+              >
+                {loadingMore ? "Loading..." : "Load more"}
+              </button>
+            )}
+          </>
         ) : (
           <p>No transactions yet.</p>
         )}

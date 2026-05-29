@@ -86,6 +86,29 @@ class ImportTransactionsCommandTests(TestCase):
             call_command("import_transactions", str(csv_path), stdout=StringIO())
             self.assertEqual(Transaction.objects.count(), 2)
 
+    def test_recategorized_row_is_treated_as_duplicate(self):
+        """If the bank (or a user) recategorizes a row, re-importing it must
+        not create a duplicate."""
+        with TemporaryDirectory() as temp_dir:
+            first = Path(temp_dir) / "a.csv"
+            first.write_text(
+                "Date,Description,Category,Amount,Status\n"
+                "2024-03-01,Coffee Shop,Food,-5.00,Posted\n",
+                encoding="utf-8",
+            )
+            call_command("import_transactions", str(first), stdout=StringIO())
+
+            # Same row but with a different category.
+            second = Path(temp_dir) / "b.csv"
+            second.write_text(
+                "Date,Description,Category,Amount,Status\n"
+                "2024-03-01,Coffee Shop,Dining,-5.00,Posted\n",
+                encoding="utf-8",
+            )
+            call_command("import_transactions", str(second), stdout=StringIO())
+
+        self.assertEqual(Transaction.objects.count(), 1)
+
     def test_imports_debit_credit_csvs(self):
         with TemporaryDirectory() as temp_dir:
             csv_path = Path(temp_dir) / "card.csv"
@@ -104,10 +127,12 @@ class ImportTransactionsCommandTests(TestCase):
 
 class TransactionApiNoAuthTests(TestCase):
     def test_anonymous_can_list_create_update_delete(self):
-        # list empty
+        # list empty (paginated response shape)
         response = self.client.get("/api/transactions/")
         self.assertEqual(response.status_code, 200)
-        self.assertEqual(response.json(), [])
+        body = response.json()
+        self.assertEqual(body["count"], 0)
+        self.assertEqual(body["results"], [])
 
         # create
         payload = {
@@ -127,7 +152,9 @@ class TransactionApiNoAuthTests(TestCase):
 
         # list returns the new row
         response = self.client.get("/api/transactions/")
-        self.assertEqual(len(response.json()), 1)
+        body = response.json()
+        self.assertEqual(body["count"], 1)
+        self.assertEqual(len(body["results"]), 1)
 
         # patch (edit)
         response = self.client.patch(
@@ -142,3 +169,51 @@ class TransactionApiNoAuthTests(TestCase):
         response = self.client.delete(f"/api/transactions/delete/{tx_id}/")
         self.assertEqual(response.status_code, 204)
         self.assertEqual(Transaction.objects.count(), 0)
+
+    def test_summary_endpoint_computes_totals_server_side(self):
+        from decimal import Decimal
+
+        for amount in ("100.00", "-25.50", "-12.34", "50.00"):
+            self.client.post(
+                "/api/transactions/",
+                data=json.dumps(
+                    {
+                        "trans_date": "2024-05-01",
+                        "trans_description": "x",
+                        "trans_category": "x",
+                        "trans_amount": amount,
+                        "account_name": "",
+                    }
+                ),
+                content_type="application/json",
+            )
+
+        response = self.client.get("/api/transactions/summary/")
+        self.assertEqual(response.status_code, 200)
+        body = response.json()
+        self.assertEqual(Decimal(body["income"]), Decimal("150.00"))
+        self.assertEqual(Decimal(body["expenses"]), Decimal("-37.84"))
+        self.assertEqual(Decimal(body["net"]), Decimal("112.16"))
+        self.assertEqual(body["count"], 4)
+
+    def test_list_pagination_respects_page_size_query_param(self):
+        for i in range(3):
+            self.client.post(
+                "/api/transactions/",
+                data=json.dumps(
+                    {
+                        "trans_date": "2024-05-01",
+                        "trans_description": f"row {i}",
+                        "trans_category": "x",
+                        "trans_amount": "1.00",
+                        "account_name": "",
+                    }
+                ),
+                content_type="application/json",
+            )
+
+        response = self.client.get("/api/transactions/?page_size=2")
+        body = response.json()
+        self.assertEqual(body["count"], 3)
+        self.assertEqual(len(body["results"]), 2)
+        self.assertIsNotNone(body["next"])
