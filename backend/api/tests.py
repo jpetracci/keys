@@ -124,6 +124,44 @@ class ImportTransactionsCommandTests(TestCase):
         amounts = list(Transaction.objects.order_by("trans_date").values_list("trans_amount", flat=True))
         self.assertEqual([str(amount) for amount in amounts], ["-10.00", "5.00"])
 
+    def test_debit_credit_ignores_csv_sign(self):
+        """Citi-style: Credit column holds negative numbers for payments. The
+        Debit/Credit column name -- not the CSV sign -- determines direction.
+        """
+        with TemporaryDirectory() as temp_dir:
+            csv_path = Path(temp_dir) / "citi.csv"
+            csv_path.write_text(
+                "Status,Date,Description,Debit,Credit\n"
+                "Cleared,03/01/2024,Charge,12.00,\n"
+                "Cleared,03/02/2024,Payment,,-2040.00\n",
+                encoding="utf-8",
+            )
+            call_command("import_transactions", str(csv_path), stdout=StringIO())
+
+        amounts = list(Transaction.objects.order_by("trans_date").values_list("trans_amount", flat=True))
+        # Charge is an expense (negative); payment is income (positive)
+        # regardless of how the source CSV signed them.
+        self.assertEqual([str(a) for a in amounts], ["-12.00", "2040.00"])
+
+    def test_flip_amounts_inverts_single_amount_column(self):
+        """Discover-style: single Amount column where charges are positive.
+        --flip-amounts inverts the sign so charges become expenses.
+        """
+        with TemporaryDirectory() as temp_dir:
+            csv_path = Path(temp_dir) / "discover.csv"
+            csv_path.write_text(
+                "Trans. Date,Description,Category,Amount\n"
+                "03/01/2024,Restaurant,Food,17.32\n"
+                "03/02/2024,Payment,Payments,-583.76\n",
+                encoding="utf-8",
+            )
+            call_command(
+                "import_transactions", str(csv_path), "--flip-amounts", stdout=StringIO()
+            )
+
+        amounts = list(Transaction.objects.order_by("trans_date").values_list("trans_amount", flat=True))
+        self.assertEqual([str(a) for a in amounts], ["-17.32", "583.76"])
+
 
 class TransactionApiNoAuthTests(TestCase):
     def test_anonymous_can_list_create_update_delete(self):

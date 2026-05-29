@@ -83,8 +83,19 @@ class Command(BaseCommand):
             "--debits-positive",
             action="store_true",
             help=(
-                "For CSVs with Debit/Credit columns, import debits as positive and credits "
-                "as negative. By default debits are negative and credits are positive."
+                "For CSVs with Debit/Credit columns, swap the interpretation: "
+                "treat the Debit column as income (positive) and Credit as expense "
+                "(negative). Use this only if the columns appear mislabeled."
+            ),
+        )
+        parser.add_argument(
+            "--flip-amounts",
+            action="store_true",
+            help=(
+                "For single-Amount-column CSVs, negate every parsed amount. Use "
+                "when the bank exports charges as positive numbers (e.g. some "
+                "Discover exports) so that they import as expenses (negative) "
+                "in our DB convention."
             ),
         )
         parser.add_argument(
@@ -160,6 +171,7 @@ class Command(BaseCommand):
                         account_name=account_name,
                         default_category=options["default_category"],
                         debits_positive=options["debits_positive"],
+                        flip_amounts=options["flip_amounts"],
                     )
                 except ValueError as exc:
                     stats["errors"] += 1
@@ -199,7 +211,7 @@ class Command(BaseCommand):
 
         return stats
 
-    def _parse_row(self, row, account_name, default_category, debits_positive):
+    def _parse_row(self, row, account_name, default_category, debits_positive, flip_amounts):
         description = self._get(row, "description") or self._get(row, "original description")
         if not description:
             raise ValueError("missing description")
@@ -213,7 +225,7 @@ class Command(BaseCommand):
             raise ValueError("missing transaction date")
 
         category = self._get(row, "category") or self._get(row, "type") or default_category
-        amount = self._parse_amount(row, debits_positive)
+        amount = self._parse_amount(row, debits_positive, flip_amounts)
 
         return {
             "trans_date": self._parse_date(raw_date),
@@ -223,19 +235,24 @@ class Command(BaseCommand):
             "account_name": account_name[:100],
         }
 
-    def _parse_amount(self, row, debits_positive):
+    def _parse_amount(self, row, debits_positive, flip_amounts):
         amount = self._get(row, "amount")
         if amount:
-            return self._to_decimal(amount)
+            value = self._to_decimal(amount)
+            return -value if flip_amounts else value
 
+        # Debit/Credit columns: the column itself encodes direction, so ignore
+        # whatever sign the CSV happens to use. Debit = money out (negative),
+        # Credit = money in (positive). --debits-positive swaps this when the
+        # columns are mislabeled.
         debit = self._get(row, "debit")
         credit = self._get(row, "credit")
         if debit:
-            value = self._to_decimal(debit)
-            return value if debits_positive else -abs(value)
+            value = abs(self._to_decimal(debit))
+            return value if debits_positive else -value
         if credit:
-            value = self._to_decimal(credit)
-            return -abs(value) if debits_positive else value
+            value = abs(self._to_decimal(credit))
+            return -value if debits_positive else value
 
         raise ValueError("missing amount")
 
