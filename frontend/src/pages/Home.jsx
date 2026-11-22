@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from "react"
 import api from "../api"
+import ImportStatement from "../components/ImportStatement"
 import Transaction from "../components/Transaction"
 import TransactionFilters from "../components/TransactionFilters"
 import { localDateString } from "../dates"
@@ -419,6 +420,8 @@ function Home() {
           <input type="submit" value="Submit" />
         </form>
       </section>
+
+      <ImportStatement onChange={syncAfterChange} />
     </main>
   )
 }

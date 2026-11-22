@@ -24,6 +24,12 @@ class Transaction(models.Model):
 
     class Meta:
         ordering = ["-trans_date", "-id"]
+        indexes = [
+            # The importer looks up every statement row by its content; without
+            # this each lookup reads the whole table, and an uploaded statement
+            # of a few thousand rows outlasts the request timeout.
+            models.Index(fields=["trans_date"], name="transaction_date_idx"),
+        ]
         constraints = [
             models.UniqueConstraint(
                 fields=["author", "import_hash"],

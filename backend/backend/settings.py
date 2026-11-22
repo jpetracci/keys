@@ -177,6 +177,12 @@ REST_FRAMEWORK = {
     ],
 }
 
+# Largest CSV statement the upload endpoint (POST /api/transactions/import/)
+# reads. 1 MB is roughly 15,000 rows, several years of one account, and takes
+# about ten seconds to import; gunicorn gives a request thirty. Larger files
+# can be split, or imported with the import_transactions command.
+STATEMENT_UPLOAD_MAX_BYTES = 1024 * 1024
+
 # Application definition
 
 INSTALLED_APPS = [

@@ -14,7 +14,7 @@ A Django + React financial transaction dashboard for importing statement CSVs, e
 
 - Django REST API with retained JWT/login/register support, but open transaction permissions
 - Transaction model with date, description, category, amount, account, and import metadata
-- CSV importer for common bank/credit-card exports
+- CSV importer for common bank/credit-card exports, as a management command and as an upload from the web page
 - React/Vite frontend for login/register, transaction summaries, manual entry, editing, and deletion
 - Filtering by `category`, `account`, `start`, and `end` (dates as `YYYY-MM-DD`) as query parameters on `/api/transactions/` and `/api/transactions/summary/`. The transaction page has controls for all four, which narrow both the list and the totals; `/api/transactions/filter-options/` lists the categories and accounts in use for its dropdowns
 - A `Dockerfile` that builds everything into one image, for deployment on Coolify or any Docker host
@@ -86,7 +86,24 @@ These are future code/security tasks, not protections supplied by this README or
 
 ## Import CSV statements
 
-For local use, import CSVs from a private `statements` folder (no user needed). Start with synthetic examples and `--dry-run`; never commit personal statements or database files:
+There are two ways to import, with the same rules: upload one file at a time from the web page, or run a command over files and folders on the machine the backend runs on. Start with synthetic examples and a preview (`--dry-run`); never commit personal statements or database files.
+
+### From the web page
+
+The **Import statement** section at the bottom of the page takes a CSV file, an optional account name and the options described below. **Preview** runs the whole import and rolls it back, then shows how many transactions it would create, how many rows it would skip, and each row that could not be used with its line number; nothing is saved. **Import** does the same and saves. Files up to 1 MB (roughly 15,000 rows) are accepted, so that an import finishes well within the server's request timeout; split a larger export by period or use the command line. A file that cannot be read as CSV is refused and none of its rows are saved.
+
+The page sends the file to `POST /api/transactions/import/` as the raw request body with `Content-Type: text/csv`, and the options as query parameters (`account`, `dry_run`, `flip_amounts`, `debits_positive`, `include_pending`, `encoding`, and `filename`, which is stored as the rows' source). The endpoint deliberately accepts no form or multipart uploads: like the rest of the API it has no login, and those are the requests a page on another website could make a visitor's browser send without asking. From a script:
+
+```bash
+curl -X POST -H "Content-Type: text/csv" --data-binary @statement.csv \
+  "http://127.0.0.1:8000/api/transactions/import/?filename=statement.csv&account=Checking&dry_run=true"
+```
+
+An uploaded file is known only by its name, so the note about rows that matched transactions from a different file (see below) compares file names alone.
+
+### From the command line
+
+Import CSVs from a private `statements` folder (no user needed):
 
 ```bash
 cd backend
@@ -99,7 +116,7 @@ Optionally attach imported records to a specific user's author metadata. This do
 python manage.py import_transactions ../statements --user YOUR_USERNAME
 ```
 
-Useful options:
+Useful options (the web page offers the same ones, except `--encoding` and `--user`):
 
 - `--dry-run` runs the whole import and then rolls it back, so the counts it reports are what a real run would do and nothing is saved
 - `--account "Checking"` tags every imported row with that account name. Use it whenever you import more than one account, one run per account (see below).
@@ -158,10 +175,17 @@ Afterwards, from the application's **Terminal** in Coolify:
 
 ```bash
 python manage.py createsuperuser        # only if you want the Django admin at /admin/
+```
+
+To import statements, use the **Import statement** section of the web page (see "Import CSV statements" above): it uploads one CSV file at a time and needs nothing on the server. A proxy in front of the app must let the upload through; Coolify's default proxy does not limit request sizes, and the app itself accepts files up to 1 MB.
+
+To import whole folders instead, the container has to see the CSV files: add a **Directory Mount** from a folder on the server to `/statements`, copy the files into that folder, and run the importer from the Terminal:
+
+```bash
 python manage.py import_transactions /statements/checking --account "Checking" --dry-run
 ```
 
-To import statements, the container has to see the CSV files: add a **Directory Mount** from a folder on the server to `/statements`, copy the files into that folder, and run the importer as above. The app runs as user id 1000 inside the container, which needs read access to that folder (and write access to `/data` if you mount a server directory there instead of a volume).
+The app runs as user id 1000 inside the container, which needs read access to that folder (and write access to `/data` if you mount a server directory there instead of a volume).
 
 Other settings: `WEB_CONCURRENCY` sets the number of gunicorn workers (default 2), `GUNICORN_CMD_ARGS` passes more gunicorn options (for example `--access-logfile -` to log every request), and `CSRF_TRUSTED_ORIGINS` lists extra origins for the admin's forms if a proxy in front does not report the original scheme.
 

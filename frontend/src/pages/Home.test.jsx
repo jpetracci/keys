@@ -10,7 +10,7 @@ const backend = vi.hoisted(() => ({ server: null }))
 vi.mock("../api", () => ({
   default: {
     get: (url, config) => backend.server.get(url, config),
-    post: (url, data) => backend.server.post(url, data),
+    post: (url, data, config) => backend.server.post(url, data, config),
     patch: (url, data) => backend.server.patch(url, data),
     delete: (url) => backend.server.delete(url),
   },
@@ -100,7 +100,15 @@ function startServer(rowCount, fieldsOf = () => ({})) {
         },
       }
     },
-    async post(url, data) {
+    async post(url, data, config) {
+      if (url.endsWith("/import/")) {
+        // Every uploaded statement holds one new transaction, named after it.
+        const created = config.params.dry_run ? 0 : 1
+        if (created) {
+          add({ trans_description: `From ${config.params.filename}`, trans_date: "2021-01-01", trans_amount: "-2.00" })
+        }
+        return { data: { dry_run: !created, created, skipped: 0, errors: 0, row_errors: [], warnings: [], note: null } }
+      }
       return { data: { ...add({ ...data }) } }
     },
     async patch(url, changes) {
@@ -528,6 +536,28 @@ describe("deleting", () => {
     expect(window.confirm).toHaveBeenCalledWith('Delete "Row 3" (-$1.00)? This cannot be undone.')
     expect(server.descriptions()).toContain("Row 3")
     expect(shown()).toContain("Row 3")
+  })
+})
+
+describe("importing a statement", () => {
+  it("reloads the list and the totals after an import, but not after a preview", async () => {
+    const server = startServer(120)
+    render(<Home />)
+    await screen.findByText("Showing 50 of 120")
+
+    fireEvent.change(screen.getByLabelText("CSV file"), {
+      target: { files: [new File(["Date,Description,Amount\n"], "march.csv", { type: "text/csv" })] },
+    })
+    fireEvent.click(screen.getByRole("button", { name: "Preview" }))
+    await screen.findByText(/Preview, nothing saved/)
+    expect(screen.getByText("Showing 50 of 120")).toBeTruthy()
+
+    fireEvent.click(screen.getByRole("button", { name: "Import" }))
+    await screen.findByText("Showing 50 of 121")
+    expect(shown()[0]).toBe("From march.csv")
+
+    await loadEverything()
+    expect(shown()).toEqual(server.descriptions())
   })
 })
 

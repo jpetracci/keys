@@ -9,6 +9,7 @@ from decimal import Decimal
 from io import StringIO
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from urllib.parse import urlencode
 
 import django
 from django.conf import settings
@@ -716,6 +717,202 @@ class CrossSiteAccessTests(TestCase):
                 self.assertEqual(response.status_code, 415)
 
         self.assertEqual(Transaction.objects.count(), 0)
+
+
+class StatementUploadTests(TestCase):
+    """POST /api/transactions/import/: the importer, for a file sent from the
+    browser instead of read from a folder on the server."""
+
+    COFFEE = "2024-01-15,Coffee,Food,-5.00,Posted\n"
+    GROCERY = "2024-01-20,Grocery,Food,-30.00,Posted\n"
+    STATEMENT = HEADER + COFFEE + GROCERY
+
+    def upload(self, body, content_type="text/csv", **params):
+        if isinstance(body, str):
+            body = body.encode()
+        return self.client.post(
+            "/api/transactions/import/", data=body, content_type=content_type, QUERY_STRING=urlencode(params)
+        )
+
+    def test_imports_the_rows_and_reports_the_counts(self):
+        response = self.upload(self.STATEMENT, filename="jan.csv", account="Checking")
+
+        self.assertEqual(response.status_code, 200, response.content)
+        self.assertEqual(
+            response.json(),
+            {
+                "dry_run": False,
+                "created": 2,
+                "skipped": 0,
+                "errors": 0,
+                "row_errors": [],
+                "warnings": [],
+                "note": None,
+            },
+        )
+        self.assertEqual(
+            sorted(Transaction.objects.values_list("trans_description", "account_name", "source_file")),
+            [("Coffee", "Checking", "jan.csv"), ("Grocery", "Checking", "jan.csv")],
+        )
+        self.assertTrue(all(t.author_id is None for t in Transaction.objects.all()))
+
+    def test_dry_run_reports_what_an_import_would_do_and_writes_nothing(self):
+        preview = self.upload(self.STATEMENT, filename="jan.csv", dry_run="true").json()
+
+        self.assertEqual((preview["dry_run"], preview["created"]), (True, 2))
+        self.assertEqual(Transaction.objects.count(), 0)
+
+        imported = self.upload(self.STATEMENT, filename="jan.csv").json()
+        self.assertEqual((imported["dry_run"], imported["created"]), (False, 2))
+        self.assertEqual(Transaction.objects.count(), 2)
+
+    def test_uploading_the_same_statement_again_creates_nothing(self):
+        self.upload(self.STATEMENT, filename="jan.csv")
+        again = self.upload(self.STATEMENT, filename="jan.csv").json()
+
+        self.assertEqual((again["created"], again["skipped"]), (0, 2))
+        self.assertIsNone(again["note"])
+        self.assertEqual(Transaction.objects.count(), 2)
+
+    def test_upload_and_command_share_one_set_of_dedup_rules(self):
+        """A statement imported from a folder and then uploaded (or the other
+        way round) is the same statement."""
+        with TemporaryDirectory() as temp_dir:
+            run_import(write_csv(temp_dir, "jan.csv", self.STATEMENT))
+            uploaded = self.upload(self.STATEMENT + "2024-01-25,Rent,Housing,-900.00,Posted\n", filename="jan.csv").json()
+            out, _ = run_import(write_csv(temp_dir, "jan.csv", self.STATEMENT))
+
+        self.assertEqual((uploaded["created"], uploaded["skipped"]), (1, 2))
+        self.assertIsNone(uploaded["note"])
+        self.assertIn("Created 0 transaction(s); skipped 2", out)
+        self.assertEqual(Transaction.objects.count(), 3)
+
+    def test_rows_matching_another_file_are_noted_unless_an_account_is_given(self):
+        self.upload(self.STATEMENT, filename="chase.csv")
+
+        merged = self.upload(self.STATEMENT, filename="citi.csv").json()
+        self.assertEqual((merged["created"], merged["skipped"]), (0, 2))
+        self.assertIn("2 skipped row(s) matched transactions", merged["note"])
+        self.assertIn("account name", merged["note"])
+
+        kept = self.upload(self.STATEMENT, filename="citi.csv", account="Citi").json()
+        self.assertEqual(kept["created"], 2)
+        self.assertIsNone(kept["note"])
+
+    def test_row_errors_are_reported_with_their_line_numbers(self):
+        body = (
+            HEADER + self.COFFEE + "2024-01-16,Broken,Food,abc,Posted\n" + ",No date,Food,-1.00,Posted\n" + self.GROCERY
+        )
+        result = self.upload(body, filename="jan.csv").json()
+
+        self.assertEqual((result["created"], result["errors"]), (2, 2))
+        self.assertEqual(
+            result["row_errors"],
+            [
+                {"line": 3, "message": "invalid amount: abc"},
+                {"line": 4, "message": "missing transaction date"},
+            ],
+        )
+
+    def test_options_are_applied(self):
+        self.upload(
+            "Date,Description,Amount,Status\n2024-03-01,Charge,12.00,Posted\n2024-03-02,Hold,3.00,Pending\n",
+            flip_amounts="true",
+            include_pending="true",
+        )
+        self.upload("Date,Description,Debit,Credit\n2024-03-03,Refund,10.00,\n", debits_positive="true")
+        self.upload((HEADER + "2024-03-04,Wide,Food,-2.00,Posted\n").encode("utf-16"), encoding="utf-16")
+
+        self.assertEqual(
+            dict(Transaction.objects.values_list("trans_description", "trans_amount")),
+            {
+                "Charge": Decimal("-12.00"),
+                "Hold": Decimal("-3.00"),
+                "Refund": Decimal("10.00"),
+                "Wide": Decimal("-2.00"),
+            },
+        )
+
+    def test_windows_1252_file_is_imported_with_a_warning(self):
+        result = self.upload((HEADER + "2024-03-01,Café Rouge,Food,-4.00,Posted\n").encode("cp1252")).json()
+
+        self.assertEqual(result["warnings"], ["not valid UTF-8, read as cp1252"])
+        self.assertEqual(Transaction.objects.get().trans_description, "Café Rouge")
+        self.assertEqual(Transaction.objects.get().source_file, "uploaded statement")
+
+    def test_folders_in_the_file_name_are_not_stored(self):
+        self.upload(self.STATEMENT, filename="C:\\Users\\me\\Downloads\\jan.csv")
+
+        self.assertEqual(set(Transaction.objects.values_list("source_file", flat=True)), {"jan.csv"})
+
+    def test_unreadable_file_is_a_400_and_saves_nothing(self):
+        oversized = "x" * (csv.field_size_limit() + 1)
+        cases = {
+            "not decodable": HEADER.encode() + b"2024-03-01,Caf\x81,Food,-4.00,Posted\n",
+            "fails part way": (HEADER + self.COFFEE + f"2024-03-02,{oversized},Food,-1.00,Posted\n").encode(),
+            "empty": b"",
+            "blank": b"\n\n",
+        }
+        for name, body in cases.items():
+            with self.subTest(name), override_settings(STATEMENT_UPLOAD_MAX_BYTES=len(oversized) * 2):
+                response = self.upload(body, filename="broken.csv")
+                self.assertEqual(response.status_code, 400, response.content)
+                self.assertIsInstance(response.json()["detail"], str)
+
+        self.assertEqual(Transaction.objects.count(), 0)
+
+    def test_unknown_option_values_are_a_400(self):
+        for params in ({"encoding": "latin-9000"}, {"encoding": "zlib"}, {"dry_run": "maybe"}):
+            with self.subTest(params):
+                response = self.upload(self.STATEMENT, **params)
+                self.assertEqual(response.status_code, 400, response.content)
+                self.assertIn(next(iter(params)), response.json())
+
+        self.assertEqual(Transaction.objects.count(), 0)
+
+    @override_settings(STATEMENT_UPLOAD_MAX_BYTES=200)
+    def test_file_over_the_size_limit_is_refused(self):
+        response = self.upload(HEADER + self.COFFEE * 10)
+
+        self.assertEqual(response.status_code, 413)
+        self.assertIn("too large", response.json()["detail"])
+        self.assertEqual(Transaction.objects.count(), 0)
+
+    def test_only_text_csv_bodies_are_accepted(self):
+        """Multipart, form-encoded and text/plain POSTs are the ones a browser
+        sends cross-site without a preflight, so an upload must not arrive as
+        any of them (nor as JSON, which the rest of the API takes)."""
+        bodies = [
+            (
+                "multipart/form-data; boundary=x",
+                '--x\r\nContent-Disposition: form-data; name="file"; filename="jan.csv"\r\n'
+                f"Content-Type: text/csv\r\n\r\n{self.STATEMENT}\r\n--x--\r\n",
+            ),
+            ("application/x-www-form-urlencoded", self.STATEMENT),
+            ("text/plain", self.STATEMENT),
+            ("application/json", json.dumps(self.STATEMENT)),
+        ]
+        for content_type, body in bodies:
+            with self.subTest(content_type=content_type):
+                response = self.upload(body, content_type=content_type)
+                self.assertEqual(response.status_code, 415)
+
+        self.assertEqual(Transaction.objects.count(), 0)
+
+    def test_upload_from_an_unlisted_origin_fails_its_preflight(self):
+        preflight = self.client.options(
+            "/api/transactions/import/",
+            HTTP_ORIGIN="https://evil.example",
+            HTTP_ACCESS_CONTROL_REQUEST_METHOD="POST",
+            HTTP_ACCESS_CONTROL_REQUEST_HEADERS="content-type",
+        )
+
+        self.assertNotIn("Access-Control-Allow-Origin", preflight.headers)
+
+    def test_csv_bodies_are_not_accepted_by_the_other_endpoints(self):
+        response = self.client.post("/api/transactions/", data=self.STATEMENT.encode(), content_type="text/csv")
+
+        self.assertEqual(response.status_code, 415)
 
 
 class RegistrationTests(TestCase):
