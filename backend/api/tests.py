@@ -644,6 +644,35 @@ class TransactionFilterTests(TestCase):
         self.assertEqual(Decimal(body["expenses"]), Decimal("-10.00"))
         self.assertEqual(body["count"], 1)
 
+    def test_filter_options_list_the_categories_and_accounts_in_use(self):
+        body = self.client.get("/api/transactions/filter-options/").json()
+
+        self.assertEqual(body, {"categories": ["Food", "Housing"], "accounts": ["Card", "Checking"]})
+
+    def test_filter_options_offer_each_value_once_whatever_its_case(self):
+        # The filters match case-insensitively, so "food" would select the
+        # same rows as "Food". Rows without an account offer no blank choice.
+        Transaction.objects.create(
+            trans_description="Snack", trans_category="food", account_name="", trans_amount="-1.00"
+        )
+        Transaction.objects.create(
+            trans_description="Bus", trans_category="transit", account_name="checking", trans_amount="-2.00"
+        )
+
+        body = self.client.get("/api/transactions/filter-options/").json()
+
+        self.assertEqual(body["categories"], ["Food", "Housing", "transit"])
+        self.assertEqual(body["accounts"], ["Card", "Checking"])
+        for category in body["categories"]:
+            self.assertTrue(self.descriptions(f"?category={category}"))
+
+    def test_filter_options_are_empty_without_transactions(self):
+        Transaction.objects.all().delete()
+
+        body = self.client.get("/api/transactions/filter-options/").json()
+
+        self.assertEqual(body, {"categories": [], "accounts": []})
+
 
 class CrossSiteAccessTests(TestCase):
     """The API has no login, so the browser's same-origin rules are all that

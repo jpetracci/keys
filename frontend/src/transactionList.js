@@ -13,16 +13,65 @@ export const MAX_PAGE_SIZE = 500 // TransactionPagination.max_page_size
 
 const LIST_URL = "/api/transactions/"
 
+// The list and the totals can be narrowed by these; "" means "not set".
+// A page number only means something for the filters it was fetched with, so
+// every request for the same list must send the same filters, and changing
+// one starts again from the first page.
+export const NO_FILTERS = { category: "", account: "", start: "", end: "" }
+
+export const hasFilters = (filters) =>
+  Object.keys(NO_FILTERS).some((name) => filters[name])
+
+// The query parameters for the filters that are set.
+export function filterParams(filters = NO_FILTERS) {
+  const params = {}
+  for (const name of Object.keys(NO_FILTERS)) {
+    if (filters[name]) params[name] = filters[name]
+  }
+  return params
+}
+
+// Whether the server would include `row` under `filters`: category and
+// account compare without regard to case, the dates are inclusive.
+export function matchesFilters(row, filters = NO_FILTERS) {
+  const same = (a, b) => (a || "").toLowerCase() === b.toLowerCase()
+  if (filters.category && !same(row.trans_category, filters.category)) return false
+  if (filters.account && !same(row.account_name, filters.account)) return false
+  if (filters.start && row.trans_date < filters.start) return false
+  if (filters.end && row.trans_date > filters.end) return false
+  return true
+}
+
+// What to tell the user when the server refuses the filters (a 400, for
+// example for a date in the year 0), or "" when `error` is something else.
+export function filterErrorMessage(error) {
+  if (error?.response?.status !== 400) return ""
+  const refused = Object.keys(error.response.data || {})
+  const names = [
+    ["start", "From date"],
+    ["end", "To date"],
+    ["category", "category"],
+    ["account", "account"],
+  ]
+    .filter(([field]) => refused.includes(field))
+    .map(([, name]) => name)
+  if (names.length === 1) {
+    return `The ${names[0]} filter is not one the server accepts. Change or clear it to see transactions.`
+  }
+  const which = names.length ? `The ${names.join(" and ")} filters` : "These filters"
+  return `${which} are not ones the server accepts. Change or clear them to see transactions.`
+}
+
 // Load the newest rows in one request: as many whole pages as it takes to
 // cover `shownCount`, so a reload keeps about as many rows on screen as there
 // were before it.
-export async function fetchFirstRows(api, shownCount = 0) {
+export async function fetchFirstRows(api, shownCount = 0, filters = NO_FILTERS) {
   const pages = Math.min(
     Math.max(1, Math.ceil(shownCount / PAGE_SIZE)),
     MAX_PAGE_SIZE / PAGE_SIZE
   )
   const res = await api.get(LIST_URL, {
-    params: { page_size: pages * PAGE_SIZE },
+    params: { ...filterParams(filters), page_size: pages * PAGE_SIZE },
   })
   return {
     rows: res.data.results || [],
@@ -30,10 +79,11 @@ export async function fetchFirstRows(api, shownCount = 0) {
   }
 }
 
-// Load one further page of PAGE_SIZE rows.
-export async function fetchPage(api, page) {
+// Load one further page of PAGE_SIZE rows, with the filters the rows already
+// on screen were loaded with.
+export async function fetchPage(api, page, filters = NO_FILTERS) {
   const res = await api.get(LIST_URL, {
-    params: { page, page_size: PAGE_SIZE },
+    params: { ...filterParams(filters), page, page_size: PAGE_SIZE },
   })
   return {
     rows: res.data.results || [],
