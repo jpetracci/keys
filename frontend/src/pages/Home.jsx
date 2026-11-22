@@ -1,11 +1,17 @@
 import { useEffect, useRef, useState } from "react"
 import api from "../api"
 import Transaction from "../components/Transaction"
+import TransactionFilters from "../components/TransactionFilters"
 import { localDateString } from "../dates"
 import {
   appendNewRows,
   fetchFirstRows,
   fetchPage,
+  filterErrorMessage,
+  filterParams,
+  hasFilters,
+  matchesFilters,
+  NO_FILTERS,
   PAGE_SIZE,
 } from "../transactionList"
 import "../styles/Home.css"
@@ -26,6 +32,7 @@ const emptyForm = () => ({
 })
 
 const EMPTY_SUMMARY = { income: "0", expenses: "0", net: "0", count: 0 }
+const NO_OPTIONS = { categories: [], accounts: [] }
 
 function Home() {
   const [transactions, setTransactions] = useState([])
@@ -39,7 +46,17 @@ function Home() {
   // may not line up with the server's pages (see transactionList.js).
   const [listStale, setListStale] = useState(false)
   const [error, setError] = useState("")
+  const [notice, setNotice] = useState("")
+  const [filters, setFilters] = useState(NO_FILTERS)
+  const [filterOptions, setFilterOptions] = useState(NO_OPTIONS)
+  // Set while the server refuses the filters: there is no list to show.
+  const [filterError, setFilterError] = useState("")
+  // The filters every request uses. A ref, not the state above, because the
+  // reload after a change runs from a handler that may have been created
+  // before the filters last changed.
+  const activeFilters = useRef(NO_FILTERS)
   const latestListRequest = useRef(0)
+  const latestSummaryRequest = useRef(0)
   const pendingReloads = useRef(0)
 
   useEffect(() => {
@@ -49,12 +66,44 @@ function Home() {
 
   // Server-side totals: always accurate regardless of pagination, and avoids
   // the floating-point drift of summing currency strings on the client.
+  // They cover the filtered set, like the list. As with the list, only the
+  // most recent request counts: totals for an earlier filter must not replace
+  // those for the current one.
   const refreshSummary = async () => {
+    const request = ++latestSummaryRequest.current
     try {
-      const res = await api.get("/api/transactions/summary/")
-      setSummary(res.data)
+      const res = await api.get("/api/transactions/summary/", {
+        params: filterParams(activeFilters.current),
+      })
+      if (request === latestSummaryRequest.current) setSummary(res.data)
     } catch (err) {
       console.error(err)
+      // Refused filters select nothing; totals for other filters would mislead.
+      if (request === latestSummaryRequest.current && filterErrorMessage(err)) {
+        setSummary(EMPTY_SUMMARY)
+      }
+    }
+  }
+
+  // The categories and accounts to offer in the filter controls.
+  const refreshFilterOptions = async () => {
+    try {
+      const res = await api.get("/api/transactions/filter-options/")
+      setFilterOptions({ ...NO_OPTIONS, ...res.data })
+    } catch (err) {
+      console.error(err)
+    }
+  }
+
+  // Fetch rows with the active filters. Filters the server refuses are not a
+  // failed load: the answer is "no rows", with a message saying why.
+  const loadRows = async (fetchRows) => {
+    try {
+      return await fetchRows(activeFilters.current)
+    } catch (err) {
+      const message = filterErrorMessage(err)
+      if (!message) throw err
+      return { rows: [], nextPage: null, filterError: message }
     }
   }
 
@@ -68,6 +117,7 @@ function Home() {
       if (request !== latestListRequest.current) return
       show(page)
       setNextPage(page.nextPage)
+      setFilterError(page.filterError || "")
     } catch (err) {
       console.error(err)
       if (request !== latestListRequest.current) return
@@ -80,7 +130,8 @@ function Home() {
   // change so the rows on screen and the next page to load always line up
   // (see transactionList.js). `created` is a row that was just added: if its
   // date puts it below everything loaded it stays pinned on top, so it is
-  // clear that it was saved.
+  // clear that it was saved. A row the filters exclude is not pinned: the
+  // list and "Showing N of M" describe the filtered set only.
   const reloadList = async (
     shownCount,
     created = null,
@@ -90,10 +141,11 @@ function Home() {
     // once the reload has settled.
     pendingReloads.current += 1
     setReloading(true)
+    const pinnable = created && matchesFilters(created, activeFilters.current)
     await requestList(
-      () => fetchFirstRows(api, shownCount),
+      () => loadRows((active) => fetchFirstRows(api, shownCount, active)),
       ({ rows }) => {
-        const pinned = created && !rows.some((row) => row.id === created.id)
+        const pinned = pinnable && !rows.some((row) => row.id === created.id)
         setTransactions(pinned ? [created, ...rows] : rows)
         setListStale(false)
       },
@@ -108,7 +160,11 @@ function Home() {
     setError("")
     await requestList(
       async () => {
-        const [page] = await Promise.all([fetchFirstRows(api), refreshSummary()])
+        const [page] = await Promise.all([
+          loadRows((active) => fetchFirstRows(api, 0, active)),
+          refreshSummary(),
+          refreshFilterOptions(),
+        ])
         return page
       },
       ({ rows }) => {
@@ -117,6 +173,15 @@ function Home() {
       },
       "Could not load transactions."
     )
+  }
+
+  // Changing a filter starts again from the first page: the rows on screen
+  // and the next page number belong to the old filters.
+  const applyFilters = (next) => {
+    activeFilters.current = next
+    setFilters(next)
+    setNotice("")
+    refresh()
   }
 
   const loadMore = async () => {
@@ -129,7 +194,7 @@ function Home() {
       await reloadList(transactions.length + PAGE_SIZE)
     } else {
       await requestList(
-        () => fetchPage(api, nextPage),
+        () => fetchPage(api, nextPage, activeFilters.current),
         ({ rows }) => setTransactions((current) => appendNewRows(current, rows)),
         "Could not load more transactions."
       )
@@ -144,6 +209,7 @@ function Home() {
   const syncAfterChange = ({ created = null, failed = false } = {}) => {
     setListStale(true)
     refreshSummary()
+    refreshFilterOptions()
     reloadList(
       transactions.length,
       created,
@@ -153,6 +219,7 @@ function Home() {
 
   const deleteTransaction = async (id) => {
     setError("")
+    setNotice("")
     let failed = false
     try {
       await api.delete(`/api/transactions/${id}/`)
@@ -167,6 +234,7 @@ function Home() {
 
   const updateTransaction = async (id, changes) => {
     setError("")
+    setNotice("")
     let failed = false
     try {
       const res = await api.patch(`/api/transactions/${id}/`, changes)
@@ -186,11 +254,18 @@ function Home() {
   const createTransaction = async (e) => {
     e.preventDefault()
     setError("")
+    setNotice("")
     let created = null
     try {
       const res = await api.post("/api/transactions/", formData)
       created = res.data
-      setTransactions((current) => [created, ...current])
+      if (matchesFilters(created, activeFilters.current)) {
+        setTransactions((current) => [created, ...current])
+      } else {
+        setNotice(
+          `Saved "${created.trans_description}". It is not listed because it does not match the filters.`
+        )
+      }
       setFormData(emptyForm())
     } catch (err) {
       setError("Could not create the transaction.")
@@ -228,6 +303,11 @@ function Home() {
       </section>
 
       {error && <p className="error-message">{error}</p>}
+      {notice && (
+        <p className="notice-message" role="status">
+          {notice}
+        </p>
+      )}
 
       <section className="transaction-section">
         <div className="section-header">
@@ -236,8 +316,17 @@ function Home() {
             Refresh
           </button>
         </div>
+        <TransactionFilters
+          filters={filters}
+          options={filterOptions}
+          onChange={applyFilters}
+        />
         {loading ? (
           <p>Loading transactions...</p>
+        ) : filterError ? (
+          <p className="error-message" role="alert">
+            {filterError}
+          </p>
         ) : transactions.length ? (
           <>
             <div className="transaction-list">
@@ -264,8 +353,12 @@ function Home() {
               </button>
             )}
           </>
-        ) : (
+        ) : !hasFilters(filters) ? (
           <p>No transactions yet.</p>
+        ) : filters.start && filters.end && filters.start > filters.end ? (
+          <p>No transactions match: the From date is after the To date.</p>
+        ) : (
+          <p>No transactions match these filters.</p>
         )}
       </section>
 

@@ -16,7 +16,7 @@ A Django + React financial transaction dashboard for importing statement CSVs, e
 - Transaction model with date, description, category, amount, account, and import metadata
 - CSV importer for common bank/credit-card exports
 - React/Vite frontend for login/register, transaction summaries, manual entry, editing, and deletion
-- Filtering by `category`, `account`, `start`, and `end` (dates as `YYYY-MM-DD`) as query parameters on `/api/transactions/` and `/api/transactions/summary/`; the frontend has no filter controls yet
+- Filtering by `category`, `account`, `start`, and `end` (dates as `YYYY-MM-DD`) as query parameters on `/api/transactions/` and `/api/transactions/summary/`. The transaction page has controls for all four, which narrow both the list and the totals; `/api/transactions/filter-options/` lists the categories and accounts in use for its dropdowns
 - A `Dockerfile` that builds everything into one image, for deployment on Coolify or any Docker host
 
 ## Backend setup

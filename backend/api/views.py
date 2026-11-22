@@ -94,6 +94,34 @@ class TransactionSummary(APIView):
         )
 
 
+class TransactionFilterOptions(APIView):
+    """The categories and accounts in use, for the frontend's filter controls.
+
+    The list and summary filters match these case-insensitively, so spellings
+    that differ only in case are offered once (the first in sort order).
+    """
+
+    def get(self, request):
+        def distinct(field):
+            values = (
+                Transaction.objects.exclude(**{field: ""})
+                .order_by()
+                .values_list(field, flat=True)
+                .distinct()
+            )
+            by_folded = {}
+            for value in sorted(values):
+                by_folded.setdefault(value.casefold(), value)
+            return sorted(by_folded.values(), key=str.casefold)
+
+        return Response(
+            {
+                "categories": distinct("trans_category"),
+                "accounts": distinct("account_name"),
+            }
+        )
+
+
 class CreateUserView(generics.CreateAPIView):
     queryset = User.objects.all()
     serializer_class = UserSerializer

@@ -18,12 +18,15 @@ vi.mock("../api", () => ({
 
 // Stand-in for the Django API: transactions newest first (by date, then id),
 // the list paged by number, 50 rows unless page_size says otherwise.
-// "Row 1" is the newest of the rows it starts with.
-function startServer(rowCount) {
+// "Row 1" is the newest of the rows it starts with. `fieldsOf(n)` gives
+// "Row n" fields other than the defaults. The list and the summary are
+// narrowed by the category, account, start and end parameters.
+function startServer(rowCount, fieldsOf = () => ({})) {
   let rows = []
   let lastId = 0
   let listFailures = 0
   let loseNextAnswer = false
+  let held = null
 
   const add = (fields) => {
     const row = { id: ++lastId, trans_category: "Test", account_name: "", ...fields }
@@ -32,17 +35,55 @@ function startServer(rowCount) {
   }
   for (let n = rowCount; n >= 1; n--) {
     const date = new Date(Date.UTC(2020, 11, 31 - (n - 1))).toISOString().slice(0, 10)
-    add({ trans_description: `Row ${n}`, trans_date: date, trans_amount: "-1.00" })
+    add({ trans_description: `Row ${n}`, trans_date: date, trans_amount: "-1.00", ...fieldsOf(n) })
   }
 
-  const inOrder = () =>
-    [...rows].sort((a, b) => b.trans_date.localeCompare(a.trans_date) || b.id - a.id)
+  const sameText = (a, b) => a.toLowerCase() === b.toLowerCase()
+  const inOrder = ({ category, account, start, end } = {}) =>
+    rows
+      .filter(
+        (row) =>
+          (!category || sameText(row.trans_category, category)) &&
+          (!account || sameText(row.account_name, account)) &&
+          (!start || row.trans_date >= start) &&
+          (!end || row.trans_date <= end)
+      )
+      .sort((a, b) => b.trans_date.localeCompare(a.trans_date) || b.id - a.id)
+  // Like Django, which has no year 0 and none past 9999.
+  const checkDates = (params) => {
+    const refused = ["start", "end"].filter(
+      (name) => params[name] && !/^(?!0000)\d{4}-\d{2}-\d{2}$/.test(params[name])
+    )
+    if (!refused.length) return
+    const error = new Error("Request failed with status code 400")
+    error.response = {
+      status: 400,
+      data: Object.fromEntries(refused.map((name) => [name, ["Date has wrong format."]])),
+    }
+    throw error
+  }
+  const sum = (list) =>
+    (list.reduce((cents, row) => cents + Math.round(Number(row.trans_amount) * 100), 0) / 100).toFixed(2)
+  const distinct = (field) => [...new Set(rows.map((row) => row[field]).filter(Boolean))].sort()
   const idIn = (url) => Number(url.match(/\/(\d+)\/$/)[1])
 
   backend.server = {
     async get(url, { params = {} } = {}) {
+      if (url.endsWith("/filter-options/")) {
+        return { data: { categories: distinct("trans_category"), accounts: distinct("account_name") } }
+      }
+      if (held && params.category === held.category) await held.gate
+      checkDates(params)
+      const matching = inOrder(params)
       if (url.endsWith("/summary/")) {
-        return { data: { income: "0", expenses: "0", net: "0", count: rows.length } }
+        return {
+          data: {
+            income: sum(matching.filter((row) => Number(row.trans_amount) >= 0)),
+            expenses: sum(matching.filter((row) => Number(row.trans_amount) < 0)),
+            net: sum(matching),
+            count: matching.length,
+          },
+        }
       }
       if (listFailures > 0) {
         listFailures -= 1
@@ -53,9 +94,9 @@ function startServer(rowCount) {
       const end = start + pageSize
       return {
         data: {
-          count: rows.length,
-          results: inOrder().slice(start, end).map((row) => ({ ...row })),
-          next: end < rows.length ? "next" : null,
+          count: matching.length,
+          results: matching.slice(start, end).map((row) => ({ ...row })),
+          next: end < matching.length ? "next" : null,
         },
       }
     },
@@ -78,7 +119,14 @@ function startServer(rowCount) {
   }
 
   return {
-    descriptions: () => inOrder().map((row) => row.trans_description),
+    descriptions: (filters) => inOrder(filters).map((row) => row.trans_description),
+    // Requests filtered by `category` get no answer until the returned
+    // function is called.
+    holdAnswersFor: (category) => {
+      let release
+      held = { category, gate: new Promise((resolve) => (release = resolve)) }
+      return release
+    },
     failNextListRequest: () => {
       listFailures += 1
     },
@@ -111,8 +159,22 @@ async function loadEverything() {
   }
 }
 
-function addTransaction({ description, amount, date }) {
+// One of the three totals above the list, as shown.
+const total = (label) => screen.getByText(label).parentElement.querySelector("strong").textContent
+
+// Choose a category or account to filter by, once the page offers it.
+async function chooseFilter(label, value) {
+  const select = screen.getByLabelText(label)
+  await within(select).findByRole("option", { name: value })
+  fireEvent.change(select, { target: { value } })
+}
+
+const setFilterDate = (label, value) =>
+  fireEvent.change(screen.getByLabelText(label), { target: { value } })
+
+function addTransaction({ description, amount, date, category }) {
   if (date) fireEvent.change(screen.getByLabelText("Date"), { target: { value: date } })
+  if (category) fireEvent.change(screen.getByLabelText("Category"), { target: { value: category } })
   fireEvent.change(screen.getByLabelText("Description"), { target: { value: description } })
   fireEvent.change(screen.getByLabelText("Amount"), { target: { value: amount } })
   fireEvent.click(screen.getByRole("button", { name: "Submit" }))
@@ -232,6 +294,225 @@ describe("the transaction list", () => {
     await loadEverything()
     expect(shown()).toEqual(server.descriptions())
     expect(shown().at(-1)).toBe("Row 1")
+  })
+})
+
+describe("filtering", () => {
+  // Rows 1..120, newest first, one a day back from 2020-12-31. Every third
+  // is food on the card at 2.00; the rest are rent from checking at 10.00.
+  const mixed = (n) =>
+    n % 3 === 0
+      ? { trans_category: "Food", account_name: "Card", trans_amount: "-2.00" }
+      : { trans_category: "Rent", account_name: "Checking", trans_amount: "-10.00" }
+  const food = { category: "Food" }
+
+  it("narrows the list and the totals, and Load more stays within the filter", async () => {
+    const server = startServer(120, mixed)
+    render(<Home />)
+    await screen.findByText("Showing 50 of 120")
+    expect(total("Expenses / Debits")).toBe("-$880.00")
+
+    await chooseFilter("Filter by category", "Food")
+
+    await screen.findByText("Showing 40 of 40")
+    expect(shown()).toEqual(server.descriptions(food))
+    expect(total("Expenses / Debits")).toBe("-$80.00")
+    expect(total("Net")).toBe("-$80.00")
+    expect(await loadMoreButton()).toBeNull()
+
+    fireEvent.click(screen.getByRole("button", { name: "Clear filters" }))
+    await chooseFilter("Filter by account", "Checking")
+
+    await screen.findByText("Showing 50 of 80")
+    expect(total("Expenses / Debits")).toBe("-$800.00")
+    await loadEverything()
+    expect(shown()).toEqual(server.descriptions({ account: "Checking" }))
+    expect(screen.getByText("Showing 80 of 80")).toBeTruthy()
+  })
+
+  it("combines a date range with the other filters, both ends included", async () => {
+    const server = startServer(120, mixed)
+    render(<Home />)
+    await screen.findByText("Showing 50 of 120")
+
+    setFilterDate("From date", "2020-12-22")
+    setFilterDate("To date", "2020-12-31")
+    await screen.findByText("Showing 10 of 10")
+    expect(shown()).toEqual(server.descriptions().slice(0, 10))
+
+    await chooseFilter("Filter by category", "Food")
+    await screen.findByText("Showing 3 of 3")
+    expect(shown()).toEqual(["Row 3", "Row 6", "Row 9"])
+    expect(total("Expenses / Debits")).toBe("-$6.00")
+  })
+
+  it("restores everything when the filters are cleared", async () => {
+    const server = startServer(120, mixed)
+    render(<Home />)
+    await screen.findByText("Showing 50 of 120")
+    expect(screen.getByRole("button", { name: "Clear filters" }).disabled).toBe(true)
+
+    await chooseFilter("Filter by category", "Food")
+    setFilterDate("From date", "2020-12-01")
+    await screen.findByText("Showing 10 of 10")
+
+    fireEvent.click(screen.getByRole("button", { name: "Clear filters" }))
+
+    await screen.findByText("Showing 50 of 120")
+    expect(screen.getByLabelText("Filter by category").value).toBe("")
+    expect(screen.getByLabelText("From date").value).toBe("")
+    expect(total("Expenses / Debits")).toBe("-$880.00")
+    await loadEverything()
+    expect(shown()).toEqual(server.descriptions())
+  })
+
+  it("says so when nothing matches", async () => {
+    startServer(5, mixed)
+    render(<Home />)
+    await screen.findByText("Showing 5 of 5")
+
+    setFilterDate("From date", "2021-06-01")
+    await screen.findByText("No transactions match these filters.")
+    expect(total("Net")).toBe("$0.00")
+
+    setFilterDate("To date", "2021-01-01")
+    await screen.findByText("No transactions match: the From date is after the To date.")
+  })
+
+  it("shows the newer filter when the answer for an older one arrives late", async () => {
+    const server = startServer(120, mixed)
+    render(<Home />)
+    await screen.findByText("Showing 50 of 120")
+
+    const releaseFood = server.holdAnswersFor("Food")
+    await chooseFilter("Filter by category", "Food")
+    await chooseFilter("Filter by category", "Rent")
+    await screen.findByText("Showing 50 of 80")
+
+    releaseFood()
+    await new Promise((resolve) => setTimeout(resolve, 20))
+
+    expect(screen.getByText("Showing 50 of 80")).toBeTruthy()
+    expect(shown()).toEqual(server.descriptions({ category: "Rent" }).slice(0, 50))
+    expect(total("Expenses / Debits")).toBe("-$800.00")
+    await loadEverything()
+    expect(shown()).toEqual(server.descriptions({ category: "Rent" }))
+  })
+
+  it("explains a date the server refuses instead of showing an empty list", async () => {
+    const server = startServer(120, mixed)
+    render(<Home />)
+    await screen.findByText("Showing 50 of 120")
+
+    setFilterDate("From date", "20260-01-01")
+
+    const alert = await screen.findByRole("alert")
+    expect(alert.textContent).toBe(
+      "The From date filter is not one the server accepts. Change or clear it to see transactions."
+    )
+    expect(shown()).toEqual([])
+    expect(screen.queryByText(/No transactions/)).toBeNull()
+    expect(total("Net")).toBe("$0.00")
+
+    setFilterDate("From date", "2020-12-30")
+    await screen.findByText("Showing 2 of 2")
+    expect(screen.queryByRole("alert")).toBeNull()
+    expect(shown()).toEqual(server.descriptions().slice(0, 2))
+  })
+
+  it("offers the categories and accounts in use, including ones just added", async () => {
+    startServer(6, mixed)
+    render(<Home />)
+    await screen.findByText("Showing 6 of 6")
+
+    const optionsOf = (label) =>
+      within(screen.getByLabelText(label))
+        .getAllByRole("option")
+        .map((option) => option.textContent)
+    await waitFor(() =>
+      expect(optionsOf("Filter by category")).toEqual(["All categories", "Food", "Rent"])
+    )
+    expect(optionsOf("Filter by account")).toEqual(["All accounts", "Card", "Checking"])
+
+    addTransaction({ description: "Bus", amount: "-3.00", category: "Transit" })
+    await waitFor(() => expect(optionsOf("Filter by category")).toContain("Transit"))
+  })
+
+  it("lists a matching transaction added under a filter, and counts it", async () => {
+    const server = startServer(180, mixed)
+    render(<Home />)
+    await screen.findByText("Showing 50 of 180")
+    await chooseFilter("Filter by category", "Food")
+    await screen.findByText("Showing 50 of 60")
+
+    addTransaction({ description: "Groceries", amount: "-5.00", category: "food" })
+
+    await screen.findByText("Showing 50 of 61")
+    expect(shown()[0]).toBe("Groceries")
+    expect(total("Expenses / Debits")).toBe("-$125.00")
+    await loadEverything()
+    expect(shown()).toEqual(server.descriptions(food))
+  })
+
+  it("does not list a transaction the filter excludes, but says it was saved", async () => {
+    const server = startServer(180, mixed)
+    render(<Home />)
+    await screen.findByText("Showing 50 of 180")
+    await chooseFilter("Filter by category", "Food")
+    await screen.findByText("Showing 50 of 60")
+
+    addTransaction({ description: "January rent", amount: "-10.00", category: "Rent" })
+
+    await screen.findByText(
+      'Saved "January rent". It is not listed because it does not match the filters.'
+    )
+    await loadEverything()
+    expect(screen.getByText("Showing 60 of 60")).toBeTruthy()
+    expect(shown()).toEqual(server.descriptions(food))
+    expect(total("Expenses / Debits")).toBe("-$120.00")
+
+    fireEvent.click(screen.getByRole("button", { name: "Clear filters" }))
+    await screen.findByText("Showing 50 of 181")
+    expect(shown()[0]).toBe("January rent")
+    expect(screen.queryByText(/It is not listed/)).toBeNull()
+  })
+
+  it("drops a row edited out of the filter without skipping the next one", async () => {
+    const server = startServer(180, mixed)
+    render(<Home />)
+    await screen.findByText("Showing 50 of 180")
+    await chooseFilter("Filter by category", "Food")
+    await screen.findByText("Showing 50 of 60")
+
+    fireEvent.click(within(rowOf("Row 30")).getByRole("button", { name: "Edit" }))
+    fireEvent.change(screen.getByLabelText("Category", { selector: ".edit-input" }), {
+      target: { value: "Rent" },
+    })
+    fireEvent.click(screen.getByRole("button", { name: "Save" }))
+
+    await screen.findByText("Showing 50 of 59")
+    expect(shown()).not.toContain("Row 30")
+    expect(shown()).toContain("Row 153")
+    expect(total("Expenses / Debits")).toBe("-$118.00")
+    await loadEverything()
+    expect(shown()).toEqual(server.descriptions(food))
+  })
+
+  it("does not skip a row after a delete under a filter", async () => {
+    const server = startServer(180, mixed)
+    render(<Home />)
+    await screen.findByText("Showing 50 of 180")
+    await chooseFilter("Filter by category", "Food")
+    await screen.findByText("Showing 50 of 60")
+
+    fireEvent.click(within(rowOf("Row 30")).getByRole("button", { name: "Delete" }))
+
+    await screen.findByText("Showing 50 of 59")
+    expect(shown()).toContain("Row 153")
+    expect(total("Expenses / Debits")).toBe("-$118.00")
+    await loadEverything()
+    expect(shown()).toEqual(server.descriptions(food))
+    expect(shown()).toHaveLength(59)
   })
 })
 
