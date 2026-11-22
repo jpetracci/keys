@@ -7,12 +7,31 @@ made both of those surface as duplicates on the next import. We now hash only
 backfill existing rows so their hashes line up.
 """
 
+import hashlib
+
 from django.db import migrations
 
-from api.management.commands.import_transactions import (
-    build_content_fingerprint,
-    hash_with_occurrence,
-)
+
+# Frozen copies of the importer's helpers as they were when this migration was
+# written. Do not import them from the importer: a migration has to keep doing
+# what it did on the day it was written, whatever the importer does later.
+def build_content_fingerprint(
+    *, user_id, account_name, trans_date, trans_description, trans_amount
+):
+    return "|".join(
+        [
+            str(user_id) if user_id is not None else "",
+            (account_name or "").lower(),
+            trans_date.isoformat() if trans_date else "",
+            (trans_description or "").lower(),
+            str(trans_amount),
+        ]
+    )
+
+
+def hash_with_occurrence(fingerprint, occurrence):
+    payload = f"{fingerprint}|{occurrence}".encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
 
 
 def recompute_hashes(apps, schema_editor):

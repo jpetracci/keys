@@ -5,6 +5,16 @@ import { ACCESS_TOKEN, REFRESH_TOKEN } from "../constants";
 import "../styles/Form.css";
 import LoadingIndicator from "./LoadingIndicator";
 
+// The API explains a rejected form as {field: [messages]} or {detail: message}
+// (for example why a password is not acceptable). Show that, not "status 400".
+function describeError(error) {
+  const data = error.response?.data;
+  if (data && typeof data === "object") {
+    return Object.values(data).flat().join("\n");
+  }
+  return error.message;
+}
+
 function Form({ route, method }) {
   const [username, setUsername] = useState("");
   const [password, setPassword] = useState("");
@@ -27,7 +37,7 @@ function Form({ route, method }) {
         navigate("/login");
       }
     } catch (error) {
-      alert(error);
+      alert(describeError(error));
     } finally {
       setLoading(false);
     }

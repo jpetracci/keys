@@ -5,6 +5,15 @@ __pycache__/
 *$py.class
 .pytest_cache/
 
+# Output of `manage.py collectstatic`
+staticfiles/
+
+# Local databases hold real transactions, whatever SQLITE_NAME calls the file
+*.sqlite3
+*.sqlite3-journal
+*.sqlite3-wal
+*.sqlite3-shm
+
 # Environment files
 .env
 *.env

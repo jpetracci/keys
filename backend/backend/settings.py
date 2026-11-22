@@ -12,10 +12,19 @@ https://docs.djangoproject.com/en/5.0/ref/settings/
 
 from pathlib import Path
 from datetime import timedelta
+from urllib.parse import parse_qsl, unquote, urlsplit
+import django
+from django.core.exceptions import ImproperlyConfigured
 from dotenv import load_dotenv
 import os
+import warnings
 
 load_dotenv()
+
+# Both values are public (this file and .env.example are in the repository),
+# so anything signed with them -- login tokens included -- can be forged.
+DEV_SECRET_KEY = "django-insecure-dev-key-change-me"
+PUBLIC_SECRET_KEYS = {DEV_SECRET_KEY, "change-me"}
 
 
 def get_env_bool(name, default=False):
@@ -32,6 +41,83 @@ def get_env_list(name, default=None):
     return [item.strip() for item in value.split(",") if item.strip()]
 
 
+def resolve_secret_key(value, debug):
+    """Return the key Django signs with, refusing a public one outside DEBUG."""
+    if debug:
+        return value or DEV_SECRET_KEY
+    if not value or value in PUBLIC_SECRET_KEYS:
+        raise ImproperlyConfigured(
+            "SECRET_KEY must be set to a private value when DEBUG is off. Set the "
+            "SECRET_KEY environment variable to a long random string. For local "
+            "development, copy backend/.env.example to backend/.env instead "
+            "(it turns DEBUG on)."
+        )
+    return value
+
+
+def hosts_from(domains):
+    """Host names of a list of domains, in the form ALLOWED_HOSTS needs.
+
+    Each domain may be a bare host, a host with a port, or a whole URL; Django
+    wants the host alone (an IPv6 address in brackets) and answers 400 to
+    everything when given anything else.
+    """
+    hosts = []
+    for domain in domains:
+        if "://" not in domain and domain.count(":") > 1 and not domain.startswith("["):
+            domain = f"[{domain}]"  # an IPv6 address written without brackets
+        try:
+            host = urlsplit(domain if "://" in domain else f"//{domain}").hostname
+        except ValueError:
+            continue
+        if host and ":" in host:
+            host = f"[{host}]"
+        if host and host not in hosts:
+            hosts.append(host)
+    return hosts
+
+
+def origins_from(domains):
+    """scheme://host[:port] of the domains that are given as URLs."""
+    origins = []
+    for domain in domains:
+        try:
+            parts = urlsplit(domain)
+        except ValueError:
+            continue
+        if parts.scheme in {"http", "https"} and parts.netloc:
+            origins.append(f"{parts.scheme}://{parts.netloc}")
+    return origins
+
+
+def database_from_url(url):
+    """Django database settings for a postgres:// connection URL, the form in
+    which Coolify shows how to reach a database it runs."""
+    # The URL holds the password, so no error message here may repeat it.
+    try:
+        parts = urlsplit(url)
+        port = parts.port
+    except ValueError as exc:
+        raise ImproperlyConfigured("DATABASE_URL is not a valid URL.") from exc
+    if parts.scheme not in {"postgres", "postgresql"}:
+        raise ImproperlyConfigured(
+            "DATABASE_URL must start with postgres:// or postgresql://."
+        )
+    database = {
+        "ENGINE": "django.db.backends.postgresql",
+        "NAME": unquote(parts.path.lstrip("/")),
+        "USER": unquote(parts.username or ""),
+        "PASSWORD": unquote(parts.password or ""),
+        "HOST": parts.hostname or "",
+        "PORT": str(port or ""),
+    }
+    # Connection parameters such as ?sslmode=require.
+    options = dict(parse_qsl(parts.query))
+    if options:
+        database["OPTIONS"] = options
+    return database
+
+
 # Build paths inside the project like this: BASE_DIR / 'subdir'.
 BASE_DIR = Path(__file__).resolve().parent.parent
 
@@ -39,16 +125,33 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 # Quick-start development settings - unsuitable for production
 # See https://docs.djangoproject.com/en/5.0/howto/deployment/checklist/
 
-# SECURITY WARNING: keep the secret key used in production secret!
-SECRET_KEY = os.getenv(
-    "SECRET_KEY",
-    "django-insecure-dev-key-change-me",
-)
-
 # SECURITY WARNING: don't run with debug turned on in production!
 DEBUG = get_env_bool("DEBUG", default=False)
 
-ALLOWED_HOSTS = get_env_list("ALLOWED_HOSTS", ["localhost", "127.0.0.1"])
+# SECURITY WARNING: keep the secret key used in production secret!
+SECRET_KEY = resolve_secret_key(os.getenv("SECRET_KEY"), DEBUG)
+
+# The domains Coolify assigned to this application. One variable has them with
+# the scheme and one without; which is which depends on the Coolify version.
+COOLIFY_DOMAINS = get_env_list("COOLIFY_FQDN") + get_env_list("COOLIFY_URL")
+
+# The app has no login, so the Host check is what stops another website from
+# reaching it through a visitor's browser under a made-up name (DNS
+# rebinding): list real names only, never "*". localhost is always included
+# because container health checks ask for it.
+ALLOWED_HOSTS = [
+    "localhost",
+    "127.0.0.1",
+    *hosts_from(get_env_list("ALLOWED_HOSTS") + COOLIFY_DOMAINS),
+]
+
+# Extra origins the admin's forms may be posted from. Not normally needed:
+# the proxy header below already tells Django its own address.
+CSRF_TRUSTED_ORIGINS = get_env_list("CSRF_TRUSTED_ORIGINS") + origins_from(COOLIFY_DOMAINS)
+
+# A reverse proxy (Coolify's Traefik) talks to this app over plain HTTP and
+# says in this header whether the browser used HTTPS.
+SECURE_PROXY_SSL_HEADER = ("HTTP_X_FORWARDED_PROTO", "https")
 
 SIMPLE_JWT = {
     "ACCESS_TOKEN_LIFETIME": timedelta(minutes=30),
@@ -64,6 +167,13 @@ REST_FRAMEWORK = {
     # on the frontend.
     "DEFAULT_PERMISSION_CLASSES": [
         "rest_framework.permissions.AllowAny",
+    ],
+    # JSON bodies only. A browser will send a form-encoded POST to another
+    # site without asking first, so accepting those would let any web page
+    # create transactions on an API that has no login. JSON needs a CORS
+    # preflight, which only the origins allowed below pass.
+    "DEFAULT_PARSER_CLASSES": [
+        "rest_framework.parsers.JSONParser",
     ],
 }
 
@@ -116,13 +226,31 @@ WSGI_APPLICATION = 'backend.wsgi.application'
 # Database
 # https://docs.djangoproject.com/en/5.0/ref/settings/#databases
 
-if get_env_bool("USE_SQLITE", default=False) or not os.getenv("DB_NAME"):
+# SQLite unless a PostgreSQL database is configured, either as one connection
+# URL (DATABASE_URL) or as separate DB_* values. USE_SQLITE=True forces SQLite.
+if get_env_bool("USE_SQLITE", default=False) or not (
+    os.getenv("DATABASE_URL") or os.getenv("DB_NAME")
+):
     DATABASES = {
         'default': {
             'ENGINE': 'django.db.backends.sqlite3',
             'NAME': os.getenv("SQLITE_NAME", BASE_DIR / 'db.sqlite3'),
+            'OPTIONS': {
+                # Wait this many seconds for another writer (a second web
+                # worker, a running import) before giving up with "database
+                # is locked".
+                'timeout': 20,
+                # Take the write lock when a transaction starts. SQLite's
+                # default takes it at the first write, which fails at once,
+                # whatever the timeout, if someone else has written since the
+                # transaction began reading: an import reads thousands of rows
+                # before it writes one. (Needs Django 5.1.)
+                **({'transaction_mode': 'IMMEDIATE'} if django.VERSION >= (5, 1) else {}),
+            },
         }
     }
+elif os.getenv("DATABASE_URL"):
+    DATABASES = {'default': database_from_url(os.environ["DATABASE_URL"])}
 else:
     DATABASES = {
         'default': {
@@ -172,11 +300,67 @@ USE_TZ = True
 
 STATIC_URL = 'static/'
 
+# `collectstatic` gathers the admin's and the API browser's files here.
+STATIC_ROOT = BASE_DIR / 'staticfiles'
+STORAGES = {
+    'default': {'BACKEND': 'django.core.files.storage.FileSystemStorage'},
+    'staticfiles': {'BACKEND': 'whitenoise.storage.CompressedStaticFilesStorage'},
+}
+
+# A production build of the frontend for this app to serve, so the site and
+# the API share one origin (see backend/views.py). The Docker image sets it.
+# Unset in development, where the Vite dev server serves the frontend.
+FRONTEND_DIST = os.getenv("FRONTEND_DIST") or None
+
+# WhiteNoise serves the collected static files and the frontend build. In
+# development neither exists and it would have nothing to do.
+if STATIC_ROOT.is_dir() or FRONTEND_DIST:
+    MIDDLEWARE.insert(
+        MIDDLEWARE.index('corsheaders.middleware.CorsMiddleware') + 1,
+        'whitenoise.middleware.WhiteNoiseMiddleware',
+    )
+    WHITENOISE_ROOT = FRONTEND_DIST
+    # These files are for this site's own pages only.
+    WHITENOISE_ALLOW_ALL_ORIGINS = False
+    # The frontend build names its scripts and styles after their content
+    # (assets/index-3fK9xQ2b.js), so a browser may keep them forever.
+    WHITENOISE_IMMUTABLE_FILE_TEST = r'^/assets/.+-[A-Za-z0-9_-]{8}\.[a-z0-9]+$'
+
+# Without this, errors are only shown when DEBUG is on (Django's default sends
+# them by email otherwise), and a failing request would leave no trace in the
+# container's log.
+LOGGING = {
+    'version': 1,
+    'disable_existing_loggers': False,
+    'handlers': {
+        'console': {'class': 'logging.StreamHandler'},
+    },
+    'root': {
+        'handlers': [] if DEBUG else ['console'],
+        'level': 'WARNING',
+    },
+}
+
 # Default primary key field type
 # https://docs.djangoproject.com/en/5.0/ref/settings/#default-auto-field
 
 DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
 
-CORS_ALLOW_ALL_ORIGINS = get_env_bool("CORS_ALLOW_ALL_ORIGINS", default=DEBUG)
-CORS_ALLOWED_ORIGINS = get_env_list("CORS_ALLOWED_ORIGINS")
-CORS_ALLOW_CREDENTIALS = True
+# Cross-origin access. The API has no login, so every origin allowed here can
+# read and change all transactions through the browser: origins are listed one
+# by one and "allow all" is not offered. Local development needs none of this
+# when the frontend uses the Vite dev server's /api proxy; the DEBUG default
+# also lets that dev server's own origin call the API directly (VITE_API_URL).
+DEV_FRONTEND_ORIGINS = ["http://localhost:5173", "http://127.0.0.1:5173"]
+CORS_ALLOWED_ORIGINS = get_env_list(
+    "CORS_ALLOWED_ORIGINS", DEV_FRONTEND_ORIGINS if DEBUG else None
+)
+# Login tokens travel in the Authorization header, not in cookies.
+CORS_ALLOW_CREDENTIALS = False
+
+if get_env_bool("CORS_ALLOW_ALL_ORIGINS"):
+    warnings.warn(
+        "CORS_ALLOW_ALL_ORIGINS is ignored: it let any website read and change "
+        "transactions through the browser. Remove it from your environment and "
+        "list any origins that need access in CORS_ALLOWED_ORIGINS."
+    )

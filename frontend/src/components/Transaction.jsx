@@ -39,8 +39,17 @@ function Transaction({ transaction, onDelete, onUpdate }) {
         account_name: draft.account_name || "",
       })
       setIsEditing(false)
+    } catch {
+      // The page shows the error; stay in edit mode so nothing typed is lost.
     } finally {
       setSaving(false)
+    }
+  }
+
+  const confirmDelete = () => {
+    const label = `"${transaction.trans_description}" (${currencyFormatter.format(amount)})`
+    if (window.confirm(`Delete ${label}? This cannot be undone.`)) {
+      onDelete(transaction.id)
     }
   }
 
@@ -50,12 +59,14 @@ function Transaction({ transaction, onDelete, onUpdate }) {
         <input
           className="edit-input"
           name="trans_description"
+          aria-label="Description"
           value={draft.trans_description}
           onChange={handleChange}
         />
         <input
           className="edit-input"
           name="trans_category"
+          aria-label="Category"
           value={draft.trans_category}
           onChange={handleChange}
         />
@@ -63,6 +74,7 @@ function Transaction({ transaction, onDelete, onUpdate }) {
           className="edit-input"
           type="date"
           name="trans_date"
+          aria-label="Date"
           value={draft.trans_date}
           onChange={handleChange}
         />
@@ -71,12 +83,14 @@ function Transaction({ transaction, onDelete, onUpdate }) {
           type="number"
           step="0.01"
           name="trans_amount"
+          aria-label="Amount"
           value={draft.trans_amount}
           onChange={handleChange}
         />
         <input
           className="edit-input"
           name="account_name"
+          aria-label="Account"
           placeholder="Account"
           value={draft.account_name || ""}
           onChange={handleChange}
@@ -113,7 +127,7 @@ function Transaction({ transaction, onDelete, onUpdate }) {
         <button
           type="button"
           className="delete-button"
-          onClick={() => onDelete(transaction.id)}
+          onClick={confirmDelete}
         >
           Delete
         </button>

@@ -6,7 +6,11 @@ from rest_framework.response import Response
 from rest_framework.views import APIView
 
 from .models import Transaction
-from .serializers import TransactionSerializer, UserSerializer
+from .serializers import (
+    TransactionFilterSerializer,
+    TransactionSerializer,
+    UserSerializer,
+)
 
 
 class TransactionPagination(pagination.PageNumberPagination):
@@ -16,11 +20,16 @@ class TransactionPagination(pagination.PageNumberPagination):
 
 
 def _filter_queryset(queryset, params):
-    """Apply the shared list/summary query filters."""
-    category = params.get("category")
-    account = params.get("account")
-    start_date = params.get("start")
-    end_date = params.get("end")
+    """Apply the shared list/summary query filters.
+
+    Malformed values (a ``start`` that is not a date) are a 400, not a crash.
+    """
+    filters = TransactionFilterSerializer(data=params)
+    filters.is_valid(raise_exception=True)
+    category = filters.validated_data.get("category")
+    account = filters.validated_data.get("account")
+    start_date = filters.validated_data.get("start")
+    end_date = filters.validated_data.get("end")
 
     if category:
         queryset = queryset.filter(trans_category__iexact=category)

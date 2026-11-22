@@ -29,7 +29,14 @@ class Transaction(models.Model):
                 fields=["author", "import_hash"],
                 condition=~Q(import_hash=""),
                 name="unique_transaction_import_per_user",
-            )
+            ),
+            # A unique index treats NULL authors as all different, so the
+            # constraint above never applies to rows imported without --user.
+            models.UniqueConstraint(
+                fields=["import_hash"],
+                condition=Q(author__isnull=True) & ~Q(import_hash=""),
+                name="unique_transaction_import_without_user",
+            ),
         ]
 
     def __str__(self):
