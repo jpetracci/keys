@@ -3,8 +3,6 @@
 A Django + React financial transaction dashboard for importing statement CSVs, editing transactions, filtering, pagination, and financial summaries. This is not a key or secret store.
 
 > **Access-control warning:** this version has no login by design. The API uses `rest_framework.permissions.AllowAny`, and the frontend renders `<Home />` without `ProtectedRoute`. Anyone who can reach the app can list, create, edit, and delete transactions. There is **no enforced per-user transaction isolation**. Login/JWT code and optional author metadata do not protect the shared transaction data. Run it only where everyone who can reach it is trusted, such as your own machine or a closed network (see "Deploying on Coolify"); do not expose it to the internet.
->
-> `backend/.choreo/endpoints.yaml` is left over from an earlier Choreo deployment and declares the API endpoint `Public`. Deploying with that file would expose the open API described above.
 
 ## Recorded dependencies
 
@@ -148,7 +146,7 @@ npm run dev
 
 The dev server forwards `/api` requests to Django at `http://127.0.0.1:8000` (see `frontend/vite.config.js`), so with `python manage.py runserver` running nothing else needs configuring. A production build also calls the API on the address it is served from, which is how the Docker image works.
 
-Set `VITE_API_URL` (in `frontend/.env`, or in the environment of `npm run build`) only to send requests somewhere else, such as the earlier Choreo path `/choreo-apis/djangoapp/backend/v1`. A different origin makes the requests cross-origin, so the address the frontend is served from must then be in the backend's `CORS_ALLOWED_ORIGINS` (the `DEBUG=True` default already covers the Vite dev server):
+Set `VITE_API_URL` (in `frontend/.env`, or in the environment of `npm run build`) only to send requests somewhere else. A different origin makes the requests cross-origin, so the address the frontend is served from must then be in the backend's `CORS_ALLOWED_ORIGINS` (the `DEBUG=True` default already covers the Vite dev server):
 
 ```env
 VITE_API_URL=http://localhost:8000
