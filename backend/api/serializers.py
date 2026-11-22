@@ -49,3 +49,34 @@ class TransactionFilterSerializer(serializers.Serializer):
     account = serializers.CharField(required=False)
     start = serializers.DateField(required=False)
     end = serializers.DateField(required=False)
+
+
+class ImportOptionsSerializer(serializers.Serializer):
+    """Query parameters of the statement upload endpoint.
+
+    They mirror the options of the ``import_transactions`` command.
+    """
+
+    account = serializers.CharField(
+        required=False, allow_blank=True, default="", max_length=100
+    )
+    filename = serializers.CharField(required=False, allow_blank=True, default="")
+    encoding = serializers.CharField(required=False, allow_blank=True, default="")
+    dry_run = serializers.BooleanField(required=False, default=False)
+    flip_amounts = serializers.BooleanField(required=False, default=False)
+    debits_positive = serializers.BooleanField(required=False, default=False)
+    include_pending = serializers.BooleanField(required=False, default=False)
+
+    def validate_encoding(self, value):
+        if not value:
+            return value
+        try:
+            # Unlike codecs.lookup, decoding also refuses codecs that are not
+            # text encodings (zlib, base64). The byte itself need not be
+            # valid in the encoding.
+            b"x".decode(value)
+        except UnicodeDecodeError:
+            pass
+        except (LookupError, ValueError) as exc:
+            raise serializers.ValidationError(f"Unknown encoding '{value}'.") from exc
+        return value
