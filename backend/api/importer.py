@@ -40,6 +40,13 @@ SOURCE_MAX_LENGTH = Transaction._meta.get_field("source_file").max_length
 DEFAULT_CATEGORY = "Uncategorized"
 # Reported (with no line number) when a file is read with the fallback encoding.
 FALLBACK_NOTICE = f"not valid UTF-8, read as {FALLBACK_ENCODING}"
+# Reported (with no line number) for a file that is only a header row.
+NO_ROWS_NOTICE = (
+    "no transactions found: the first line is read as the column names and "
+    "there are no rows below it"
+)
+# Rows per query. SQLite accepts at most 999 parameters in older versions.
+QUERY_BATCH = 500
 
 
 class UnreadableStatement(Exception):
@@ -170,8 +177,12 @@ def _import_rows(
     # statements repeat the same transaction, and a count that spans files
     # would import the overlap a second time.
     seen_in_file = {}
+    candidates = []
+    rows_read = 0
 
-    for row_number, row in enumerate(reader, start=2):
+    for row_number, raw_row in enumerate(reader, start=2):
+        rows_read += 1
+        row = _normalize(raw_row)
         try:
             transaction = _parse_row(
                 row,
@@ -199,8 +210,17 @@ def _import_rows(
         )
         occurrence = seen_in_file.get(fingerprint, 0)
         seen_in_file[fingerprint] = occurrence + 1
+        candidates.append((transaction, fingerprint, occurrence))
 
-        existing_sources = _existing_sources(user, transaction)
+    if not rows_read:
+        report(None, NO_ROWS_NOTICE)
+
+    # The stored rows are read up front, a few queries for the whole file: a
+    # query per row made a large statement outlast the request timeout.
+    stored_sources = _stored_sources(user, [c[0] for c in candidates])
+    new_rows = []
+    for transaction, fingerprint, occurrence in candidates:
+        existing_sources = stored_sources.get(_content_key(transaction), ())
         if occurrence < len(existing_sources):
             # The database already holds at least `occurrence + 1` copies
             # of this content, so this row is a re-import.
@@ -208,26 +228,27 @@ def _import_rows(
             if not any(is_same_source(stored) for stored in existing_sources):
                 stats["matched_elsewhere"] += 1
             continue
+        new_rows.append((transaction, hash_with_occurrence(fingerprint, occurrence)))
 
-        import_hash = hash_with_occurrence(fingerprint, occurrence)
-        if Transaction.objects.filter(author=user, import_hash=import_hash).exists():
+    stored_hashes = _stored_hashes(user, [import_hash for _, import_hash in new_rows])
+    to_create = []
+    for transaction, import_hash in new_rows:
+        if import_hash in stored_hashes:
             # Imported before and edited since: its content no longer
             # matches this row, but its hash still identifies it.
             stats["skipped"] += 1
             continue
-
-        Transaction.objects.create(
-            author=user,
-            trans_date=transaction["trans_date"],
-            trans_description=transaction["trans_description"],
-            trans_category=transaction["trans_category"],
-            trans_amount=transaction["trans_amount"],
-            account_name=transaction["account_name"],
-            source_file=source,
-            import_hash=import_hash,
+        to_create.append(
+            Transaction(
+                author=user,
+                source_file=source,
+                import_hash=import_hash,
+                **transaction,
+            )
         )
-        stats["created"] += 1
 
+    Transaction.objects.bulk_create(to_create, batch_size=QUERY_BATCH)
+    stats["created"] = len(to_create)
     return stats
 
 
@@ -244,17 +265,66 @@ def _decode(raw, encoding, report):
     return text.removeprefix(BYTE_ORDER_MARK)
 
 
-def _existing_sources(user, transaction):
-    """Source file of every stored row with the same content as this one."""
-    return list(
-        Transaction.objects.filter(
-            author=user,
-            account_name=transaction["account_name"],
-            trans_date=transaction["trans_date"],
-            trans_description=transaction["trans_description"],
-            trans_amount=transaction["trans_amount"],
-        ).values_list("source_file", flat=True)
+def _batches(values):
+    values = list(values)
+    for start in range(0, len(values), QUERY_BATCH):
+        yield values[start : start + QUERY_BATCH]
+
+
+def _content_key(transaction):
+    return (
+        transaction["trans_date"],
+        transaction["trans_description"],
+        transaction["trans_amount"],
     )
+
+
+def _stored_sources(user, transactions):
+    """Source file of every stored row with the content of one of these rows.
+
+    Keyed by _content_key. The rows of one file share an account, so the
+    stored rows are narrowed by account and by the dates in the file.
+    """
+    if not transactions:
+        return {}
+    wanted = {_content_key(transaction) for transaction in transactions}
+    sources = {}
+    for dates in _batches(sorted({key[0] for key in wanted})):
+        stored = Transaction.objects.filter(
+            author=user,
+            account_name=transactions[0]["account_name"],
+            trans_date__in=dates,
+        ).values_list("trans_date", "trans_description", "trans_amount", "source_file")
+        for *key, source_file in stored.iterator():
+            key = tuple(key)
+            if key in wanted:
+                sources.setdefault(key, []).append(source_file)
+    return sources
+
+
+def _stored_hashes(user, import_hashes):
+    """Those of the given import hashes that a stored row already carries."""
+    found = set()
+    for batch in _batches(import_hashes):
+        found.update(
+            Transaction.objects.filter(
+                author=user, import_hash__in=batch
+            ).values_list("import_hash", flat=True)
+        )
+    return found
+
+
+def _normalize(row):
+    """The row with its column names trimmed and lowercased.
+
+    Of two columns whose names then coincide, the first one wins.
+    """
+    normalized = {}
+    for key, value in row.items():
+        # Cells beyond the header row arrive under the key None, as a list.
+        if isinstance(key, str):
+            normalized.setdefault(key.strip().lower(), value)
+    return normalized
 
 
 def _parse_row(row, account_name, default_category, debits_positive, flip_amounts):
@@ -339,7 +409,6 @@ def _amount_cell(row, name):
 
 
 def _get(row, name):
-    for key, value in row.items():
-        if key and key.strip().lower() == name:
-            return (value or "").strip()
-    return ""
+    """A cell of a row from _normalize, trimmed; "" when it is missing."""
+    value = row.get(name)
+    return value.strip() if isinstance(value, str) else ""

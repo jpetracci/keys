@@ -18,6 +18,7 @@ from django.core.exceptions import ImproperlyConfigured
 from django.core.management import CommandError, call_command
 from django.db import IntegrityError, connection, transaction
 from django.db.migrations.executor import MigrationExecutor
+from django.test.utils import CaptureQueriesContext
 from django.test import SimpleTestCase, TestCase, TransactionTestCase, override_settings
 
 from backend import settings as project_settings
@@ -675,6 +676,23 @@ class TransactionFilterTests(TestCase):
         self.assertEqual(body, {"categories": [], "accounts": []})
 
 
+class FilterOptionsSpellingTests(TestCase):
+    def test_every_offered_choice_shows_all_the_rows_it_stands_for(self):
+        for category in ("Café", "CAFÉ", "Food", "FOOD"):
+            Transaction.objects.create(
+                trans_description="x", trans_category=category, trans_amount="-1.00"
+            )
+
+        offered = self.client.get("/api/transactions/filter-options/").json()["categories"]
+        shown = 0
+        for category in offered:
+            listed = self.client.get("/api/transactions/", {"category": category}).json()
+            shown += listed["count"]
+
+        self.assertEqual(shown, 4)
+        self.assertEqual(sum(c.lower() == "food" for c in offered), 1)
+
+
 class CrossSiteAccessTests(TestCase):
     """The API has no login, so the browser's same-origin rules are all that
     stop a web page on another site from using it."""
@@ -755,6 +773,39 @@ class StatementUploadTests(TestCase):
             [("Coffee", "Checking", "jan.csv"), ("Grocery", "Checking", "jan.csv")],
         )
         self.assertTrue(all(t.author_id is None for t in Transaction.objects.all()))
+
+    def test_a_file_with_no_rows_says_so(self):
+        for body in (HEADER, "not a statement at all"):
+            with self.subTest(body=body):
+                result = self.upload(body, filename="jan.csv").json()
+
+                self.assertEqual((result["created"], result["skipped"], result["errors"]), (0, 0, 0))
+                self.assertEqual(len(result["warnings"]), 1)
+                self.assertIn("no transactions found", result["warnings"][0])
+
+    def test_the_number_of_queries_does_not_grow_with_the_file(self):
+        def statement(rows):
+            return HEADER + "".join(
+                f"2024-01-{day % 28 + 1:02d},Shop {day},Food,-{day}.00,Posted\n" for day in range(rows)
+            )
+
+        self.upload(statement(40), filename="old.csv")
+        with CaptureQueriesContext(connection) as small:
+            self.upload(statement(50), filename="a.csv", dry_run="true")
+        with CaptureQueriesContext(connection) as large:
+            result = self.upload(statement(450), filename="b.csv").json()
+
+        self.assertEqual((result["created"], result["skipped"]), (410, 40))
+        # Batches of rows, not rows: 400 more rows may add a few queries.
+        self.assertLess(len(large), len(small) + 10)
+
+    def test_repeated_rows_are_each_kept_once_across_overlapping_uploads(self):
+        self.upload(HEADER + self.COFFEE + self.COFFEE, filename="jan.csv")
+        again = self.upload(HEADER + self.COFFEE * 3 + self.GROCERY, filename="feb.csv").json()
+
+        self.assertEqual((again["created"], again["skipped"]), (2, 2))
+        self.assertEqual(Transaction.objects.filter(trans_description="Coffee").count(), 3)
+        self.assertEqual(Transaction.objects.values("import_hash").distinct().count(), 4)
 
     def test_dry_run_reports_what_an_import_would_do_and_writes_nothing(self):
         preview = self.upload(self.STATEMENT, filename="jan.csv", dry_run="true").json()

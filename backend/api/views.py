@@ -1,6 +1,6 @@
 from django.conf import settings
 from django.contrib.auth.models import User
-from django.db import transaction as db_transaction
+from django.db import connection, transaction as db_transaction
 from django.db.models import Sum, Q
 from rest_framework import generics, pagination, status
 from rest_framework.exceptions import APIException, ParseError
@@ -100,6 +100,15 @@ class TransactionSummary(APIView):
         )
 
 
+_ASCII_LOWER = str.maketrans(
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZ", "abcdefghijklmnopqrstuvwxyz"
+)
+
+
+def _fold_ascii(value):
+    return value.translate(_ASCII_LOWER)
+
+
 class TransactionFilterOptions(APIView):
     """The categories and accounts in use, for the frontend's filter controls.
 
@@ -108,6 +117,14 @@ class TransactionFilterOptions(APIView):
     """
 
     def get(self, request):
+        # Offer one choice for exactly the spellings the filter treats as one.
+        # SQLite ignores case only for the letters A to Z, so there "Café" and
+        # "CAFÉ" are two choices: one could not show the rows of both.
+        if connection.vendor == "sqlite":
+            fold = _fold_ascii
+        else:
+            fold = str.casefold
+
         def distinct(field):
             values = (
                 Transaction.objects.exclude(**{field: ""})
@@ -117,7 +134,7 @@ class TransactionFilterOptions(APIView):
             )
             by_folded = {}
             for value in sorted(values):
-                by_folded.setdefault(value.casefold(), value)
+                by_folded.setdefault(fold(value), value)
             return sorted(by_folded.values(), key=str.casefold)
 
         return Response(

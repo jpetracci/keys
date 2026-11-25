@@ -88,7 +88,7 @@ There are two ways to import, with the same rules: upload one file at a time fro
 
 ### From the web page
 
-The **Import statement** section at the bottom of the page takes a CSV file, an optional account name and the options described below. **Preview** runs the whole import and rolls it back, then shows how many transactions it would create, how many rows it would skip, and each row that could not be used with its line number; nothing is saved. **Import** does the same and saves. Files up to 1 MB (roughly 15,000 rows) are accepted, so that an import finishes well within the server's request timeout; split a larger export by period or use the command line. A file that cannot be read as CSV is refused and none of its rows are saved.
+The **Import statement** section at the bottom of the page takes a CSV file, an optional account name and the options described below. **Preview** runs the whole import and rolls it back, then shows how many transactions it would create, how many rows it would skip, and each row that could not be used with its line number; nothing is saved. **Import** does the same and saves. Files up to 1 MB (roughly 15,000 rows) are accepted; split a larger export by period or use the command line. A file with no rows below its header line is reported as having no transactions. A file that cannot be read as CSV is refused and none of its rows are saved.
 
 The page sends the file to `POST /api/transactions/import/` as the raw request body with `Content-Type: text/csv`, and the options as query parameters (`account`, `dry_run`, `flip_amounts`, `debits_positive`, `include_pending`, `encoding`, and `filename`, which is stored as the rows' source). The endpoint deliberately accepts no form or multipart uploads: like the rest of the API it has no login, and those are the requests a page on another website could make a visitor's browser send without asking. From a script:
 
@@ -185,7 +185,7 @@ python manage.py import_transactions /statements/checking --account "Checking" -
 
 The app runs as user id 1000 inside the container, which needs read access to that folder (and write access to `/data` if you mount a server directory there instead of a volume).
 
-Other settings: `WEB_CONCURRENCY` sets the number of gunicorn workers (default 2), `GUNICORN_CMD_ARGS` passes more gunicorn options (for example `--access-logfile -` to log every request), and `CSRF_TRUSTED_ORIGINS` lists extra origins for the admin's forms if a proxy in front does not report the original scheme.
+Other settings: `WEB_CONCURRENCY` sets the number of gunicorn workers (default 2), `GUNICORN_CMD_ARGS` passes more gunicorn options (for example `--access-logfile -` to log every request, or `--timeout 300` to replace the 120-second request timeout the container sets), and `CSRF_TRUSTED_ORIGINS` lists extra origins for the admin's forms if a proxy in front does not report the original scheme.
 
 The same image runs anywhere Docker does:
 

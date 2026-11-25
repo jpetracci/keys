@@ -64,6 +64,9 @@ if [ -z "${WEB_CONCURRENCY:-}" ]; then
     export WEB_CONCURRENCY=2
 fi
 
-# More gunicorn options can be given in GUNICORN_CMD_ARGS, for example
-# GUNICORN_CMD_ARGS="--access-logfile -" to log every request.
+# gunicorn stops a request after 30 seconds by default, which a statement
+# upload on a slow disk could exceed. More gunicorn options can be given in
+# GUNICORN_CMD_ARGS, for example "--access-logfile -" to log every request;
+# they come last, so a --timeout given there replaces this one.
+export GUNICORN_CMD_ARGS="--timeout 120 ${GUNICORN_CMD_ARGS:-}"
 exec gunicorn backend.wsgi --bind "0.0.0.0:${PORT:-8000}"
