@@ -161,10 +161,11 @@ def _import_rows(
 
     Deduplication is content-only (no filename or row number), so the same
     statement re-imported under a different name -- or a statement that
-    overlaps a previous import -- adds nothing. A row is new when the file
-    holds more copies of its content than the database does; each copy gets
-    an occurrence index so genuinely repeated rows (two identical $5 coffee
-    charges on one day) are all kept.
+    overlaps a previous import -- adds nothing. Rows with the same content
+    are settled together: each stored row accounts for one of them, and the
+    rest are new, so genuinely repeated rows (two identical $5 coffee charges
+    on one day) are all kept. See _settle_copies for what "accounts for"
+    means.
     """
     stats = {"created": 0, "skipped": 0, "errors": 0, "matched_elsewhere": 0}
 
@@ -173,10 +174,6 @@ def _import_rows(
     if not reader.fieldnames:
         raise MissingHeader()
 
-    # Occurrences are counted per file, never across files: overlapping
-    # statements repeat the same transaction, and a count that spans files
-    # would import the overlap a second time.
-    seen_in_file = {}
     candidates = []
     rows_read = 0
 
@@ -208,48 +205,97 @@ def _import_rows(
             trans_description=transaction["trans_description"],
             trans_amount=transaction["trans_amount"],
         )
-        occurrence = seen_in_file.get(fingerprint, 0)
-        seen_in_file[fingerprint] = occurrence + 1
-        candidates.append((transaction, fingerprint, occurrence))
+        candidates.append((transaction, fingerprint))
 
     if not rows_read:
         report(None, NO_ROWS_NOTICE)
 
+    # Copies are counted per file, never across files: overlapping statements
+    # repeat the same transaction, and a count that spans files would import
+    # the overlap a second time.
+    copies = {}
+    for index, (_, fingerprint) in enumerate(candidates):
+        copies.setdefault(fingerprint, []).append(index)
+    hashes = {
+        fingerprint: [hash_with_occurrence(fingerprint, n) for n in range(len(members))]
+        for fingerprint, members in copies.items()
+    }
+
     # The stored rows are read up front, a few queries for the whole file: a
     # query per row made a large statement outlast the request timeout.
-    stored_sources = _stored_sources(user, [c[0] for c in candidates])
-    new_rows = []
-    for transaction, fingerprint, occurrence in candidates:
-        existing_sources = stored_sources.get(_content_key(transaction), ())
-        if occurrence < len(existing_sources):
-            # The database already holds at least `occurrence + 1` copies
-            # of this content, so this row is a re-import.
-            stats["skipped"] += 1
-            if not any(is_same_source(stored) for stored in existing_sources):
-                stats["matched_elsewhere"] += 1
-            continue
-        new_rows.append((transaction, hash_with_occurrence(fingerprint, occurrence)))
+    stored_by_content = _stored_by_content(user, [c[0] for c in candidates])
+    stored_by_hash = _stored_by_hash(
+        user, [import_hash for group in hashes.values() for import_hash in group]
+    )
 
-    stored_hashes = _stored_hashes(user, [import_hash for _, import_hash in new_rows])
-    to_create = []
-    for transaction, import_hash in new_rows:
-        if import_hash in stored_hashes:
-            # Imported before and edited since: its content no longer
-            # matches this row, but its hash still identifies it.
-            stats["skipped"] += 1
-            continue
-        to_create.append(
-            Transaction(
-                author=user,
-                source_file=source,
-                import_hash=import_hash,
-                **transaction,
+    new_rows = {}
+    for fingerprint, members in copies.items():
+        new_rows.update(
+            _settle_copies(
+                [(index, _content_key(candidates[index][0])) for index in members],
+                hashes[fingerprint],
+                stored_by_content,
+                stored_by_hash,
+                is_same_source,
+                stats,
             )
         )
 
+    # New rows are saved in the order they have in the file.
+    to_create = [
+        Transaction(
+            author=user,
+            source_file=source,
+            import_hash=new_rows[index],
+            **candidates[index][0],
+        )
+        for index in sorted(new_rows)
+    ]
     Transaction.objects.bulk_create(to_create, batch_size=QUERY_BATCH)
     stats["created"] = len(to_create)
     return stats
+
+
+def _settle_copies(rows, hashes, stored_by_content, stored_by_hash, is_same_source, stats):
+    """Decide which of the file's rows with one content are new.
+
+    ``rows`` are those rows as (index, content key) and ``hashes`` the import
+    hashes such rows can carry, one per row. A stored row accounts for one of
+    the rows when its content is the same, or when it carries one of the
+    hashes: it was imported as this content and edited since. The rows left
+    over are new. Only the number of stored rows counts, never which of them
+    remain, so a row that was imported and then deleted comes back on the
+    next import whichever copy it was.
+
+    Returns {index: import hash} for the new rows and adds the others to
+    ``stats``.
+    """
+    stored = {key: stored_by_content.get(key, ()) for _, key in rows}
+    accounted_for = {row_id for found in stored.values() for row_id, _ in found}
+    accounted_for.update(stored_by_hash[h] for h in hashes if h in stored_by_hash)
+    to_skip = min(len(rows), len(accounted_for))
+
+    skipped = set()
+    # First the rows whose exact content is stored (rows of one content can
+    # still differ in the case of their letters)...
+    unmatched = {key: len(found) for key, found in stored.items()}
+    for index, key in rows:
+        if len(skipped) < to_skip and unmatched[key]:
+            unmatched[key] -= 1
+            skipped.add(index)
+            if not any(is_same_source(source) for _, source in stored[key]):
+                stats["matched_elsewhere"] += 1
+    # ...then the earliest of the others, for the stored rows edited since.
+    for index, _ in rows:
+        if len(skipped) < to_skip:
+            skipped.add(index)
+    stats["skipped"] += to_skip
+
+    # A stored row that carries one of the hashes is always accounted for, so
+    # at least as many hashes are unused as there are new rows.
+    unused = [h for h in hashes if h not in stored_by_hash]
+    new = [index for index, _ in rows if index not in skipped]
+    return dict(zip(new, unused))
 
 
 def _decode(raw, encoding, report):
@@ -279,37 +325,38 @@ def _content_key(transaction):
     )
 
 
-def _stored_sources(user, transactions):
-    """Source file of every stored row with the content of one of these rows.
+def _stored_by_content(user, transactions):
+    """The stored rows with the content of one of these rows.
 
-    Keyed by _content_key. The rows of one file share an account, so the
-    stored rows are narrowed by account and by the dates in the file.
+    Returns {content key: [(id, source file), ...]}. The rows of one file
+    share an account, so the stored rows are narrowed by account and by the
+    dates in the file.
     """
     if not transactions:
         return {}
     wanted = {_content_key(transaction) for transaction in transactions}
-    sources = {}
+    found = {}
     for dates in _batches(sorted({key[0] for key in wanted})):
         stored = Transaction.objects.filter(
             author=user,
             account_name=transactions[0]["account_name"],
             trans_date__in=dates,
-        ).values_list("trans_date", "trans_description", "trans_amount", "source_file")
-        for *key, source_file in stored.iterator():
+        ).values_list("id", "trans_date", "trans_description", "trans_amount", "source_file")
+        for row_id, *key, source_file in stored.iterator():
             key = tuple(key)
             if key in wanted:
-                sources.setdefault(key, []).append(source_file)
-    return sources
+                found.setdefault(key, []).append((row_id, source_file))
+    return found
 
 
-def _stored_hashes(user, import_hashes):
-    """Those of the given import hashes that a stored row already carries."""
-    found = set()
+def _stored_by_hash(user, import_hashes):
+    """The stored rows that carry one of these import hashes, as {hash: id}."""
+    found = {}
     for batch in _batches(import_hashes):
         found.update(
             Transaction.objects.filter(
                 author=user, import_hash__in=batch
-            ).values_list("import_hash", flat=True)
+            ).values_list("import_hash", "id")
         )
     return found
 

@@ -396,6 +396,101 @@ class ImporterDedupTests(TestCase):
         self.assertEqual(Transaction.objects.count(), 1)
         self.assertNotIn("Note:", out)
 
+    def import_body(self, body):
+        with TemporaryDirectory() as temp_dir:
+            out, _ = run_import(write_csv(temp_dir, "jan.csv", body))
+        return out
+
+    def test_an_edited_row_is_not_imported_again(self):
+        """The importer remembers which row it made from a statement row, so
+        correcting a description does not bring the original back."""
+        body = HEADER + self.COFFEE
+        self.import_body(body)
+        Transaction.objects.update(trans_description="Coffee with Sam")
+
+        self.assertIn("Created 0 transaction(s); skipped 1", self.import_body(body))
+        self.assertEqual(Transaction.objects.get().trans_description, "Coffee with Sam")
+
+    def test_a_deleted_copy_comes_back_whichever_copy_it_was(self):
+        """Three identical charges, one deleted: the statement still says
+        three, so the next import restores one. Which of them was deleted
+        used to decide whether that happened."""
+        body = HEADER + self.COFFEE * 3
+        for position in range(3):
+            with self.subTest(deleted=position):
+                Transaction.objects.all().delete()
+                self.import_body(body)
+                Transaction.objects.order_by("id")[position].delete()
+
+                self.assertIn("Created 1 transaction(s); skipped 2", self.import_body(body))
+                self.assertEqual(Transaction.objects.count(), 3)
+                self.assertEqual(Transaction.objects.values("import_hash").distinct().count(), 3)
+                self.assertIn("Created 0 transaction(s); skipped 3", self.import_body(body))
+
+    def test_several_deleted_copies_all_come_back(self):
+        body = HEADER + self.COFFEE * 3
+        for kept in range(3):
+            with self.subTest(kept=kept):
+                Transaction.objects.all().delete()
+                self.import_body(body)
+                keep = Transaction.objects.order_by("id")[kept]
+                Transaction.objects.exclude(id=keep.id).delete()
+
+                self.assertIn("Created 2 transaction(s); skipped 1", self.import_body(body))
+                self.assertEqual(Transaction.objects.values("import_hash").distinct().count(), 3)
+
+    def test_an_edited_copy_stays_edited_and_a_deleted_copy_comes_back(self):
+        body = HEADER + self.COFFEE * 2
+        for edited in (0, 1):
+            with self.subTest(edited=edited):
+                Transaction.objects.all().delete()
+                self.import_body(body)
+                rows = list(Transaction.objects.order_by("id"))
+                Transaction.objects.filter(id=rows[edited].id).update(trans_description="Coffee with Sam")
+                rows[1 - edited].delete()
+
+                self.assertIn("Created 1 transaction(s); skipped 1", self.import_body(body))
+                self.assertEqual(
+                    sorted(Transaction.objects.values_list("trans_description", flat=True)),
+                    ["Coffee", "Coffee with Sam"],
+                )
+
+    def test_an_edited_row_and_a_hand_entered_row_each_stand_for_one_copy(self):
+        """Two charges on the statement and two rows that answer for them:
+        one edited after its import, one typed in by hand. Nothing is new,
+        whichever of the two imported rows was the edited one."""
+        body = HEADER + self.COFFEE * 2
+        for edited in (0, 1):
+            with self.subTest(edited=edited):
+                Transaction.objects.all().delete()
+                self.import_body(body)
+                rows = list(Transaction.objects.order_by("id"))
+                Transaction.objects.filter(id=rows[edited].id).update(trans_description="Coffee with Sam")
+                rows[1 - edited].delete()
+                Transaction.objects.create(
+                    trans_date="2024-01-15", trans_description="Coffee", trans_amount="-5.00"
+                )
+
+                self.assertIn("Created 0 transaction(s); skipped 2", self.import_body(body))
+                self.assertEqual(Transaction.objects.count(), 2)
+
+    def test_the_spelling_that_went_missing_is_the_one_restored(self):
+        """Rows that differ only in the case of their letters are copies of
+        one transaction to the importer, but the deleted spelling is the one
+        that has to come back."""
+        body = HEADER + self.COFFEE + self.COFFEE.replace("Coffee", "COFFEE")
+        for deleted in ("Coffee", "COFFEE"):
+            with self.subTest(deleted=deleted):
+                Transaction.objects.all().delete()
+                self.import_body(body)
+                Transaction.objects.get(trans_description=deleted).delete()
+
+                self.assertIn("Created 1 transaction(s); skipped 1", self.import_body(body))
+                self.assertEqual(
+                    sorted(Transaction.objects.values_list("trans_description", flat=True)),
+                    ["COFFEE", "Coffee"],
+                )
+
     def test_pending_rows_are_skipped_unless_included(self):
         body = HEADER + self.COFFEE + "2024-01-16,Gas,Auto,-40.00,Pending\n"
         with TemporaryDirectory() as temp_dir:
