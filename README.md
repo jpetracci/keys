@@ -6,7 +6,13 @@ A Django + React financial transaction dashboard for importing statement CSVs, e
 
 ## Recorded dependencies
 
-`backend/requirements.txt` specifies ranges, including Django `>=5.0,<7` and Django REST Framework `>=3.15,<4`, rather than exact backend pins. The frontend lockfile records React 18.3.1, React Router 7.18.6, Vite 8.3.8, `@vitejs/plugin-react` 6.0.2, Vitest 5.1.1, and jsdom 31.0.1. Vite and the React plugin declare Node `^20.19.0 || >=22.12.0`; the two that only `npm test` needs are stricter: Vitest declares `^22.12.0 || ^24.0.0 || >=26.0.0` and jsdom `^22.22.2 || ^24.15.0 || >=26.0.0`. The Docker image is built on `python:3.13-slim` and `node:24-alpine`. Use the checked-in manifests/lockfile as the dependency reference, not an assumption that arbitrary newer versions work.
+`backend/requirements.txt` specifies ranges, including Django `>=5.0,<7` and Django REST Framework `>=3.15,<4`. `backend/requirements.lock` records the exact version of every backend package that the Docker image and CI install, currently Django 6.1.3 and Django REST Framework 3.18.3. The frontend lockfile records React 18.3.1, React Router 7.18.6, Vite 8.3.8, `@vitejs/plugin-react` 6.0.2, Vitest 5.1.1, and jsdom 31.0.1. Vite and the React plugin declare Node `^20.19.0 || >=22.12.0`; the two that only `npm test` needs are stricter: Vitest declares `^22.12.0 || ^24.0.0 || >=26.0.0` and jsdom `^22.22.2 || ^24.15.0 || >=26.0.0`. The Docker image is built on `python:3.13-slim` and `node:24-alpine`. Use the checked-in manifests/lockfile as the dependency reference, not an assumption that arbitrary newer versions work.
+
+To move the backend to newer versions, write the lock file again with the image's Python and commit it; CI fails when it no longer matches what the image installs:
+
+```bash
+docker run --rm -v "$PWD/backend/requirements.txt:/requirements.txt:ro" python:3.13-slim sh -c "pip install -q -r /requirements.txt && pip freeze" > backend/requirements.lock
+```
 
 ## What is included
 
@@ -29,6 +35,8 @@ python manage.py migrate
 python manage.py createsuperuser
 python manage.py runserver
 ```
+
+`pip install -r requirements.txt` installs the newest versions the ranges allow. To get exactly the versions the Docker image runs, use `pip install -r requirements.txt -c requirements.lock` instead; those versions need Python 3.12 or newer.
 
 The activation command above is for a Unix-like shell. In Windows Command Prompt, use `.venv\Scripts\activate.bat`; in PowerShell, use `.venv\Scripts\Activate.ps1` with an execution policy appropriate for your environment. On Windows, `copy .env.example .env` replaces the `cp` line.
 
@@ -67,7 +75,7 @@ Because the API has no login, two browser-facing checks are what keep other webs
 - **Same-origin rules.** The backend accepts JSON request bodies only and sends CORS headers only to origins listed in `CORS_ALLOWED_ORIGINS` (with `DEBUG=True` and no list: the Vite dev server's own origin, `http://localhost:5173` or `http://127.0.0.1:5173`). `CORS_ALLOW_ALL_ORIGINS` is no longer honored; if an older `.env` still sets it, the backend prints a warning and ignores it.
 - **Host names.** The API, the admin, and the app's pages answer only under the names in `ALLOWED_HOSTS`, plus `localhost` and `127.0.0.1`, which are always accepted. (Scripts, styles, and other static files hold no data and are served under any name.) List the real names the app is reached by, as host names or addresses; a scheme or port typed along with one is ignored. Do not set it to `*`.
 
-`python manage.py runserver` is for local development only. A deployment runs gunicorn: the Docker image does, and so does `backend/Procfile` on platforms that read one.
+`python manage.py runserver` is for local development only. A deployment runs gunicorn, as the Docker image does.
 
 ## Authentication
 
@@ -215,6 +223,7 @@ python manage.py test
 
 ```bash
 docker build -t keys .
+docker run --rm keys pip freeze | diff - backend/requirements.lock
 docker run --rm -e DEBUG=True keys python manage.py test
 ```
 

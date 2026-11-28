@@ -23,8 +23,9 @@ jobs:
         with:
           python-version: "3.13"
           cache: pip
-          cache-dependency-path: backend/requirements.txt
-      - run: pip install -r requirements.txt
+          cache-dependency-path: backend/requirements.lock
+      # The versions the image runs, not the newest that the ranges allow.
+      - run: pip install -r requirements.txt -c requirements.lock
       - run: python manage.py check
       - run: python manage.py makemigrations --check --dry-run
       - run: python manage.py test
@@ -52,6 +53,10 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - run: docker build -t keys .
+      - name: The lock file lists exactly what the image installed
+        # Fails when requirements.txt changed and the lock was not refreshed
+        # (the README's "Recorded dependencies" section has the command).
+        run: docker run --rm keys pip freeze | diff - backend/requirements.lock
       - name: Run the backend tests inside the image
         run: docker run --rm -e DEBUG=True keys python manage.py test
       - name: Start the container and wait until it reports healthy
@@ -69,3 +74,4 @@ jobs:
           curl -fsS http://localhost:8000/api/health/
           curl -fsS http://localhost:8000/ | grep -q '<div id="root">'
           curl -fsS http://localhost:8000/login | grep -q '<div id="root">'
+          curl -fsS http://localhost:8000/favicon.svg | grep -q '<svg'

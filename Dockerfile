@@ -29,8 +29,10 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends curl \
     && rm -rf /var/lib/apt/lists/*
 
-COPY backend/requirements.txt ./
-RUN pip install -r requirements.txt
+# requirements.txt names what the app needs; requirements.lock holds the exact
+# version of every package, so the same commit always builds the same image.
+COPY backend/requirements.txt backend/requirements.lock ./
+RUN pip install -r requirements.txt -c requirements.lock
 
 COPY backend/ ./
 COPY --from=frontend /frontend/dist ./frontend_dist
